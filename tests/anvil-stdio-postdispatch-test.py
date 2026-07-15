@@ -89,6 +89,7 @@ def write_fake_emacsclient(path: Path, bash: str) -> None:
     """Create a builtin-only Bash emacsclient with controlled responses."""
     source = r"""#!__BASH__
 set -u
+umask 077
 
 if [[ -n ${ALTERNATE_EDITOR+x} ]]; then
     printf 'ALTERNATE_EDITOR leaked into emacsclient\n' >&2
@@ -116,13 +117,13 @@ case "$expression" in
         bump "$FAKE_PROBE_COUNT"
         printf 't\n'
         ;;
-    '(test-init)')
+    '(if t (progn (test-init) "anvil-mcp-lifecycle-complete") "anvil-mcp-headless-not-ready")')
         bump "$FAKE_INIT_COUNT"
-        printf 't\n'
+        printf '"anvil-mcp-lifecycle-complete"\n'
         ;;
-    '(test-stop)')
+    '(if t (progn (test-stop) "anvil-mcp-lifecycle-complete") "anvil-mcp-headless-not-ready")')
         bump "$FAKE_STOP_COUNT"
-        printf 't\n'
+        printf '"anvil-mcp-lifecycle-complete"\n'
         ;;
     *)
         bump "$FAKE_DISPATCH_COUNT"
@@ -136,6 +137,9 @@ case "$expression" in
                 exit 64
                 ;;
         esac
+        if [[ "$expression" == *anvil-mcp-staged-consumed:* ]]; then
+            wire="anvil-mcp-staged-consumed:$wire"
+        fi
         printf '%s' "$BUMP_VALUE" > "$FAKE_DISPATCH_COMPLETE"
         IFS= read -r _ < "$FAKE_DISPATCH_ACK_FIFO"
         if [[ "$index" -eq 1 ]]; then
@@ -1917,7 +1921,9 @@ def run_negative_control(
             raise AssertionError("metadata override injection point drifted")
         metadata_override = (
             "anvil_mcp_request_metadata() {\n"
-            f"\tprintf '%s' {shlex.quote(metadata)}\n"
+            f"\tANVIL_MCP_RUN_OUTPUT={shlex.quote(metadata)}\n"
+            "\tANVIL_MCP_RUN_STATUS=0\n"
+            "\treturn 0\n"
             "}\n\n"
         )
         source = source.replace(needle, injected, 1)
@@ -2199,7 +2205,7 @@ def run_large_request_metadata(
     with tempfile.TemporaryDirectory(prefix="anvil-stdio-large-request-") as raw_root:
         root = Path(raw_root)
         source = stdio.read_text(encoding="utf-8")
-        needle = '\tlocal basename="$1"\n'
+        needle = "\toriginal_umask=$(umask)\n"
         if source.count(needle) != 1:
             raise AssertionError("staging function marker changed")
         restrictive_stdio = root / "anvil-stdio-restrictive-umask.sh"
@@ -2292,37 +2298,42 @@ def run_large_request_metadata(
                     raise AssertionError("staged request bytes differ")
                 return staged
 
+            def consume_staged_request(expected: bytes) -> None:
+                staged = assert_staged_request(expected)
+                staged_paths.append(staged)
+                staged.unlink()
+                staged.parent.rmdir()
+
             wait_for_dispatch_complete(
                 paths["dispatch_complete"],
                 process,
                 paths["dispatch_ack_fifo"],
                 1,
-                lambda: staged_paths.append(assert_staged_request(legacy_bytes)),
+                lambda: consume_staged_request(legacy_bytes),
             )
             read_reply(reader, first, framed=False)
             paths["dispatch_complete"].unlink()
             assert_same_bridge(process, original_pid, pipe_ids)
-            # The fake emacsclient does not evaluate the production
-            # unwind-protect that removes a consumed staged request.  Mirror
-            # that successful-dispatch cleanup before staging request two.
-            first_staged = staged_paths.pop()
-            first_staged.unlink()
-            first_staged.parent.rmdir()
+            staged_paths.pop()
 
             try:
                 send(process, framed_document, framed=True)
             except BrokenPipeError as error:
                 raise AssertionError(reader.diagnostics()) from error
 
-            wait_for_dispatch_complete(
-                paths["dispatch_complete"],
-                process,
-                paths["dispatch_ack_fifo"],
-                2,
-                lambda: staged_paths.append(assert_staged_request(framed_bytes)),
-            )
+            try:
+                wait_for_dispatch_complete(
+                    paths["dispatch_complete"],
+                    process,
+                    paths["dispatch_ack_fifo"],
+                    2,
+                    lambda: consume_staged_request(framed_bytes),
+                )
+            except AssertionError as error:
+                raise AssertionError(reader.diagnostics()) from error
             read_reply(reader, second, framed=True)
             paths["dispatch_complete"].unlink()
+            staged_paths.pop()
             assert_same_bridge(process, original_pid, pipe_ids)
 
             try:
@@ -2369,8 +2380,10 @@ def run_stage_kill_cleanup(
     stdio: Path,
     bash: str,
     real_helpers: dict[str, str],
+    *,
+    cleanup_failure: bool = False,
 ) -> None:
-    """Require parent cleanup after SIGKILL prevents helper unwinding."""
+    """Require fail-closed custody after SIGKILL prevents helper unwinding."""
     with tempfile.TemporaryDirectory(prefix="anvil-stdio-stage-kill-") as raw_root:
         root = Path(raw_root)
         source = stdio.read_text(encoding="utf-8")
@@ -2381,6 +2394,15 @@ def run_stage_kill_cleanup(
             needle,
             "    os.kill(os.getpid(), signal.SIGKILL)",
         )
+        if cleanup_failure:
+            cleanup_needle = "anvil_mcp_cleanup_request_directory() {\n"
+            if killed_source.count(cleanup_needle) != 1:
+                raise AssertionError("staging cleanup marker changed")
+            killed_source = killed_source.replace(
+                cleanup_needle,
+                cleanup_needle + "\treturn 74\n",
+                1,
+            )
         killed_stdio = root / "anvil-stdio-stage-kill.sh"
         killed_stdio.write_text(killed_source, encoding="utf-8")
         killed_stdio.chmod(0o755)
@@ -2434,10 +2456,31 @@ def run_stage_kill_cleanup(
                 # intentionally ambiguous runner failure, reported as the
                 # bridge's stable software-error status rather than exposing
                 # shell-specific signal arithmetic (128 + SIGKILL).
-                synthetic_stage_error("stage-kill", 70),
+                synthetic_stage_error("stage-kill", 74 if cleanup_failure else 70),
                 framed=True,
             )
-            if list(paths["temp"].glob("anvil-mcp.*")):
+            staged = list(paths["temp"].glob("anvil-mcp.*"))
+            if cleanup_failure:
+                process.stdin.close()
+                process.wait(timeout=5)
+                if (
+                    process.returncode != 74
+                    or not staged
+                    or read_count(paths["dispatch_count"]) != 0
+                    or not wait_until(
+                        lambda: not process_group_alive(process.pid), 2
+                    )
+                ):
+                    raise AssertionError(
+                        "failed staging cleanup did not stop custody: "
+                        f"rc={process.returncode} "
+                        f"staged={[path.name for path in staged]!r} "
+                        f"dispatches={read_count(paths['dispatch_count'])} "
+                        f"diagnostics={reader.diagnostics()}"
+                    )
+                clean = True
+                return
+            if staged:
                 raise AssertionError("killed staging helper left private paths")
             if read_count(paths["dispatch_count"]) != 0:
                 raise AssertionError("failed staging reached dispatch")
@@ -2556,6 +2599,12 @@ def main() -> int:
             parent_guard_python,
         )
     run_stage_kill_cleanup(stdio, bash, real_helpers)
+    run_stage_kill_cleanup(
+        stdio,
+        bash,
+        real_helpers,
+        cleanup_failure=True,
+    )
     run_large_request_metadata(stdio, bash, real_helpers)
     run_positive(stdio, bash, real_helpers)
     print(f"stdio-postdispatch-ok bash={bash}")

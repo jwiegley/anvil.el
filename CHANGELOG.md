@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The stdio bridge now applies headless readiness in the same Emacs event as
+  initialization, request dispatch, and shutdown; treats only an exact raw
+  not-ready sentinel as replay-safe; proves large staged requests were consumed;
+  forwards termination through bounded child-group cleanup; and hard-bounds
+  request lines, frame headers, and helper output.
 - Count UTF-8 and other multibyte output limits in bytes without splitting a
   character, and report exact omitted-byte counts whenever the marker fits.
 - The aggregate test runner now bounds every child stream, retains only a

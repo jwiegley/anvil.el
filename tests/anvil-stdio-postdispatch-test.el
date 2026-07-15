@@ -76,10 +76,14 @@
       (insert-file-contents bridge)
       (let ((source (buffer-string)))
         (should (string-match-p "unset ALTERNATE_EDITOR" source))
-        (should (= 3
+        (should (= 2
                    (how-many
                     (regexp-quote
                      "-t \"$ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT\"")
+                    (point-min) (point-max))))
+        (should (= 4
+                   (how-many
+                    (regexp-quote "anvil_mcp_discard_until_sentinel \\")
                     (point-min) (point-max))))
         (should
          (string-match-p
@@ -97,6 +101,11 @@
         (should
          (string-match-p
           (regexp-quote "readonly ANVIL_MCP_MAX_HEADER_BYTES=65536")
+          source))
+        (should
+         (string-match-p
+          (regexp-quote
+           "readonly ANVIL_MCP_MAX_HELPER_OUTPUT_BYTES=67108864")
           source))
         (should (string-match-p "anvil_mcp_stage_request()" source))
         (should
