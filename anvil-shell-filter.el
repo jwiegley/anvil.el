@@ -1192,7 +1192,13 @@ detail."
   (let* ((trace-id (and anvil-shell-filter-trace-events
                         (anvil-shell-filter--trace-new-id)))
          (trace-start (and trace-id (current-time)))
-         (filter-opt (or (plist-get opts :filter) 'auto))
+         ;; An explicit nil means passthrough; only an absent :filter option
+         ;; selects automatic compression.  `or' cannot distinguish those
+         ;; cases and silently turns the MCP tool's documented empty-string
+         ;; passthrough into `auto'.
+         (filter-opt (if (plist-member opts :filter)
+                         (plist-get opts :filter)
+                       'auto))
          (timeout
           (anvil-shell-filter--bounded-sync-timeout
            (or (plist-get opts :timeout)

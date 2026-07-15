@@ -932,6 +932,33 @@ Pipeline order under test:
         (should-not (plist-get result :filter))
         (should (equal "one\ntwo\nthree" (plist-get result :compressed)))))))
 
+(ert-deftest anvil-shell-filter-test/explicit-nil-filter-skips-auto ()
+  "An explicit nil filter remains passthrough instead of selecting auto."
+  (anvil-shell-filter-test--with-state
+    (let ((raw (string-join
+                (append (cl-loop for i from 1 to 80
+                                 collect (format "noise-%02d" i))
+                        '("FAILED: keep every line"))
+                "\n")))
+      (cl-letf (((symbol-function 'anvil-shell)
+                 (lambda (_cmd _opts)
+                   (list :exit 2 :stdout raw :stderr ""))))
+        (let ((result (anvil-shell-filter-run
+                       "unknown-tool --verbose" :filter nil)))
+          (should-not (plist-get result :filter))
+          (should (equal raw (plist-get result :compressed))))))))
+
+(ert-deftest anvil-shell-filter-test/tool-empty-filter-skips-auto ()
+  "The MCP shell-run empty-string contract requests passthrough."
+  (let (seen)
+    (cl-letf (((symbol-function 'anvil-shell-filter-run)
+               (lambda (_cmd &rest opts)
+                 (setq seen opts)
+                 '(:exit 0 :filter nil :compressed "raw"))))
+      (anvil-shell-filter--tool-shell-run "printf raw" "" 5 nil)
+      (should (plist-member seen :filter))
+      (should-not (plist-get seen :filter)))))
+
 (ert-deftest anvil-shell-filter-test/sync-timeout-cap-precedes-spawn ()
   "Oversize shell-run requests fail before starting a child."
   (let ((anvil-shell-filter-max-sync-timeout 2)
