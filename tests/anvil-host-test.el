@@ -127,6 +127,57 @@ line on exit; the wrapper silences it with `:sentinel #'ignore'
   (let ((res (anvil-shell "exit 7" '(:timeout 3))))
     (should (eql 7 (plist-get res :exit)))))
 
+(ert-deftest anvil-host-test-output-limits-count-encoded-bytes ()
+  "Presentation limits preserve characters and report omitted bytes."
+  (should (equal "c…" (anvil-host--truncate "café" 4)))
+  (should (= 4 (string-bytes (anvil-host--truncate "café" 4))))
+  (should (equal "café" (anvil-host--truncate "café" 5)))
+  (let* ((raw (concat (make-string 64 ?x) "é"))
+         (truncated (anvil-host--truncate raw 64)))
+    (should (= 64 (string-bytes truncated)))
+    (should
+     (string-match
+      "\n\\.\\.\\.\\[anvil-host: truncated, \\([0-9]+\\) more bytes\\]\\'"
+      truncated))
+    (let ((prefix (substring truncated 0 (match-beginning 0)))
+          (omitted (string-to-number (match-string 1 truncated))))
+      (should
+       (= omitted (- (string-bytes raw) (string-bytes prefix))))))
+  (let ((truncated
+         (anvil-shell "printf 'caf\\303\\251'"
+                      '(:timeout 3 :max-output 4)))
+        (exact
+         (anvil-shell "printf 'caf\\303\\251'"
+                      '(:timeout 3 :max-output 5))))
+    (should (plist-get truncated :truncated))
+    (should (equal "c…" (plist-get truncated :stdout)))
+    (should (= 4 (string-bytes (plist-get truncated :stdout))))
+    (should-not (plist-get exact :truncated))
+    (should (equal "café" (plist-get exact :stdout)))))
+
+(ert-deftest anvil-host-test-rejects-invalid-output-limit-before-spawn ()
+  "Malformed presentation limits fail before starting a host child."
+  (cl-letf (((symbol-function 'anvil-host--run)
+             (lambda (&rest _args)
+               (ert-fail "invalid output limit reached the host runner"))))
+    (dolist (limit '(-1 1.5 "4"))
+      (should-error
+       (anvil-shell "printf no" (list :max-output limit))
+       :type 'error))))
+
+(ert-deftest anvil-host-test-marker-is-inside-every-byte-budget ()
+  "Every cap is strict for multibyte and high-byte unibyte source."
+  (dolist (raw
+           (list
+            (concat (make-string 180 ?x) "é漢🙂")
+            (apply #'unibyte-string (make-list 180 255))))
+    (dolist (cap (number-sequence 0 256))
+      (let ((result
+             (anvil-host--truncate-with-marker
+              raw cap
+              (lambda (omitted) (format "…[%d bytes omitted]" omitted)))))
+        (should (<= (string-bytes result) cap))))))
+
 ;;;; --- §7.2 late stderr capture (stderr-pipe drain) ----------------------
 
 (ert-deftest anvil-host-test-shell-captures-late-stderr ()

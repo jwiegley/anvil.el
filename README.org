@@ -305,7 +305,7 @@ sister package).  Highlights:
 | =anvil-claude-watchdog= (2026-05) | Linux procfs/jsonl watchdog for Claude Code TUI hangs.  Detects State=R stalls and the State=S spinner/MCP-child-IO variant, records events, notifies the desktop, and offers confirmation-gated manual recovery via =claude --resume= staged in tmux |
 | =anvil-sexp= / =sexp-cst= / =py= / =ts= / =js= (v0.4.0) | Language-aware structural edits.  Reader-based Elisp edits, tree-sitter CST for Python / TypeScript / TSX / JavaScript — AST-level refactors without touching whole files |
 | =anvil-session= + Claude Code hooks (v0.4.0) | Session snapshot / resume + 5 lifecycle hooks (PreCompact / SessionStart / PostToolUse / UserPromptSubmit / SessionEnd).  Captures branch + task summary with 14-day TTL so session restarts don't re-cold |
-| =anvil-shell-filter= (v0.4.0) | Shell output compression — 20 bundled filters for git / rg / pytest / ert-batch / docker-logs etc.  Raw output stashed with TTL so callers can still recover full text when needed |
+| =anvil-shell-filter= (v0.4.0) | Shell output compression — 20 bundled filters for git / rg / pytest / ert-batch / docker-logs etc.  A bounded raw prefix is stashed with TTL for follow-up context; genuinely large output belongs in a file |
 | =file-batch= | Apply multiple edits to the same file atomically in one round trip (up to ~90% token reduction) |
 | =org-read-outline= / =org-read-headline= | Read just the headings or a single subtree, even on a 13,000-line org. No full-file read needed |
 | =anvil-worker= | Dispatch long-running tasks (OCR, PDF conversion, batch file scans) to a separate background Emacs. The interactive Emacs never freezes |
@@ -1471,8 +1471,8 @@ feeding it back into the main reasoning loop.
 
 - Use `shell-run` for shell commands whose stdout can be filtered
   automatically. It returns compressed stdout plus a `tee-id`; recover
-  the raw output with `shell-tee-get` only when the compressed view is
-  insufficient.
+  the bounded raw prefix with `shell-tee-get` only when the compressed
+  view is insufficient. Redirect genuinely large output to a file.
 - Use `context-compress` for non-shell text: API JSON, RAG snippets,
   web/article extracts, logs from another tool, diffs, or code
   excerpts. Set `store=true` when the raw text may be needed later;

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Host shell capture now has a non-optional 16 MiB ceiling per stream,
+  including when `anvil-shell` receives `:max-output nil`. Crossing the
+  ceiling retires the child transaction and returns an error; redirect larger
+  output to a file.
+- Shell tee and per-line limits are strict byte budgets, including their
+  truncation markers. Tee retrieval returns a bounded raw prefix rather than
+  promising an unlimited copy.
+
+### Fixed
+
+- Count UTF-8 and other multibyte output limits in bytes without splitting a
+  character, and report exact omitted-byte counts whenever the marker fits.
+- The aggregate test runner now bounds every child stream, retains only a
+  bounded head/tail for failed files, prints those diagnostics in batch mode,
+  and exits nonzero for subprocess failures that produced no ERT summary.
+
 ## [1.3.0] - 2026-06-26
 
 Develop-line release focused on broader AI maintainer workflows: codebase

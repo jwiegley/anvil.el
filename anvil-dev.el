@@ -36,6 +36,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'anvil-host)
 (require 'anvil-server)
 
 (defgroup anvil-dev nil
@@ -51,7 +52,13 @@ gaps surface before the next daemon restart."
   :type '(choice (const :tag "No dev clone" nil) directory)
   :group 'anvil-dev)
 
-(defcustom anvil-dev-emacs-bin (or (executable-find "emacs") "emacs")
+(defcustom anvil-dev-emacs-bin
+  (let ((current
+         (and invocation-directory invocation-name
+              (expand-file-name invocation-name invocation-directory))))
+    (or (and current (file-executable-p current) current)
+        (executable-find "emacs")
+        "emacs"))
   "Emacs binary used to spawn test subprocesses from the test runner."
   :type 'file
   :group 'anvil-dev)
@@ -61,6 +68,16 @@ gaps surface before the next daemon restart."
 The default accepts both the per-module form `anvil-MOD-test.el'
 and the core aggregator `anvil-test.el'."
   :type 'regexp
+  :group 'anvil-dev)
+
+(defcustom anvil-dev-test-file-timeout 300
+  "Maximum seconds allowed for one isolated ERT file."
+  :type 'number
+  :group 'anvil-dev)
+
+(defcustom anvil-dev-failure-output-max-bytes (* 256 1024)
+  "Maximum failed-file output bytes printed by the batch reporter."
+  :type 'integer
   :group 'anvil-dev)
 
 (defconst anvil-dev--server-id "emacs-eval"
@@ -203,32 +220,117 @@ Handles both the unskipped and skipped forms of the summary line."
 Returns a result plist with :file :ok :exit :elapsed-ms :total
 :passed :failed :skipped :output."
   (let* ((start (float-time))
-         (buf (generate-new-buffer " *anvil-dev-test-out*"))
          (tests-dir (expand-file-name "tests" root))
-         (exit (let ((default-directory (file-name-as-directory root)))
-                 (apply #'call-process
-                        anvil-dev-emacs-bin nil buf nil
-                        (append
-                         (list "--batch"
-                               "--eval" "(setq load-prefer-newer t)"
-                               "-L" root)
-                         (and (file-directory-p tests-dir)
-                              (list "-L" tests-dir))
-                         (list "-l" "ert" "-l" file
-                               "-f" "ert-run-tests-batch-and-exit")))))
+         (arguments
+          (append
+           (list "--batch"
+                 "--eval" "(setq load-prefer-newer t)"
+                 "-L" root)
+           (and (file-directory-p tests-dir)
+                (list "-L" tests-dir))
+           (list "-l" "ert" "-l" file
+                 "-f" "ert-run-tests-batch-and-exit")))
+         (command
+          (mapconcat #'shell-quote-argument
+                     (cons anvil-dev-emacs-bin arguments) " "))
+         (run
+          (condition-case error-data
+              (anvil-host--run command 'utf-8-unix root
+                               anvil-dev-test-file-timeout)
+            (error
+             (list 70 ""
+                   (format "Anvil test runner failed: %s\n"
+                           (error-message-string error-data))))))
+         (exit (nth 0 run))
          (elapsed (- (float-time) start))
-         (output (with-current-buffer buf (buffer-string))))
-    (kill-buffer buf)
-    (let ((summary (anvil-dev--parse-ert-summary output)))
+         (output (anvil-dev--combine-test-output (nth 1 run) (nth 2 run))))
+    (let* ((summary (anvil-dev--parse-ert-summary output))
+           (ok (and (integerp exit) (zerop exit))))
       (list :file       (file-name-nondirectory file)
             :exit       exit
-            :ok         (and (integerp exit) (zerop exit))
+            :ok         ok
             :elapsed-ms (round (* elapsed 1000))
             :total      (or (plist-get summary :total) 0)
             :passed     (or (plist-get summary :passed) 0)
             :failed     (or (plist-get summary :failed) 0)
             :skipped    (or (plist-get summary :skipped) 0)
-            :output     output))))
+            ;; Aggregate runs retain 106 result plists.  Keep green logs out
+            ;; of that resident set and reduce a red log immediately after
+            ;; parsing its full ERT summary.
+            :output     (and (not ok)
+                             (anvil-dev--bounded-failure-output
+                              output anvil-dev-failure-output-max-bytes))))))
+
+(defun anvil-dev--combine-test-output (stdout stderr)
+  "Combine STDOUT and STDERR with an explicit boundary when both exist."
+  (cond
+   ((string-empty-p stdout) stderr)
+   ((string-empty-p stderr) stdout)
+   (t
+    (concat "--- stdout ---\n"
+            stdout
+            (unless (string-suffix-p "\n" stdout) "\n")
+            "--- stderr ---\n"
+            stderr))))
+
+(defun anvil-dev--byte-prefix (string max-bytes)
+  "Return the longest whole-character prefix of STRING within MAX-BYTES."
+  (let ((low 0)
+        (high (length string)))
+    (while (< low high)
+      (let ((middle (/ (+ low high 1) 2)))
+        (if (<= (string-bytes (substring string 0 middle)) max-bytes)
+            (setq low middle)
+          (setq high (1- middle)))))
+    (substring string 0 low)))
+
+(defun anvil-dev--byte-suffix (string max-bytes)
+  "Return the longest whole-character suffix of STRING within MAX-BYTES."
+  (let ((low 0)
+        (high (length string))
+        (length (length string)))
+    (while (< low high)
+      (let ((middle (/ (+ low high 1) 2)))
+        (if (<= (string-bytes (substring string (- length middle))) max-bytes)
+            (setq low middle)
+          (setq high (1- middle)))))
+    (substring string (- length low))))
+
+(defun anvil-dev--bounded-failure-output (output max-bytes)
+  "Bound OUTPUT to MAX-BYTES, retaining whole-character head and tail."
+  (unless (and (integerp max-bytes) (>= max-bytes 0))
+    (error "Anvil failure output limit must be a nonnegative integer"))
+  (setq output (or output ""))
+  (unless (multibyte-string-p output)
+    (setq output (decode-coding-string output 'utf-8 t)))
+  (let ((total-bytes (string-bytes output)))
+    (if (<= total-bytes max-bytes)
+        output
+      (let* ((largest-marker
+              (format "\n...[anvil-dev: %d bytes omitted]...\n" total-bytes))
+             (marker-bytes (string-bytes largest-marker)))
+        (if (> marker-bytes max-bytes)
+            (anvil-host--short-truncation output max-bytes)
+          (let* ((content-budget (- max-bytes marker-bytes))
+                 (head-budget (/ content-budget 2))
+                 (tail-budget (- content-budget head-budget))
+                 (head (anvil-dev--byte-prefix output head-budget))
+                 (tail (anvil-dev--byte-suffix output tail-budget))
+                 (omitted (- total-bytes
+                             (string-bytes head)
+                             (string-bytes tail)))
+                 (marker
+                  (format "\n...[anvil-dev: %d bytes omitted]...\n" omitted)))
+            (concat head marker tail)))))))
+
+(defun anvil-dev--failure-output-for-report (output)
+  "Return bounded OUTPUT followed by exactly one delimiter newline."
+  (concat
+   (replace-regexp-in-string
+    "[\r\n]+\\'" ""
+    (anvil-dev--bounded-failure-output
+     output anvil-dev-failure-output-max-bytes))
+   "\n"))
 
 ;;;###autoload
 (cl-defun anvil-dev-test-run-all (&optional project-dir &key minimal)
@@ -236,7 +338,8 @@ Returns a result plist with :file :ok :exit :elapsed-ms :total
 Each file runs in its own subprocess so one file's load error
 cannot mask failures in others.  Returns an aggregated plist:
   :project-dir ROOT :file-count N :total T :passed P :failed F
-  :skipped S :elapsed-ms MS :failed-files (FILE...) :per-file (PLIST...)
+  :failed-file-count B :skipped S :elapsed-ms MS
+  :failed-files (FILE...) :per-file (PLIST...)
 
 With non-nil :MINIMAL, the per-file list is omitted entirely,
 cutting the return value down to the aggregate counters plus
@@ -266,6 +369,7 @@ diagnosis can always fall back to a non-minimal run."
                          :total        total
                          :passed       passed
                          :failed       failed
+                         :failed-file-count (length bad)
                          :skipped      skipped
                          :elapsed-ms   elapsed-ms
                          :failed-files (mapcar (lambda (r) (plist-get r :file)) bad))))
@@ -277,26 +381,41 @@ diagnosis can always fall back to a non-minimal run."
             base
           (append base (list :per-file results)))))))
 
+(defun anvil-dev--report-batch-result (result)
+  "Print compact RESULT summaries and full diagnostics for failed files."
+  (message "\n== anvil test-run-all ==")
+  (dolist (file-result (plist-get result :per-file))
+    (message "  %-38s %d/%d  %s  %dms"
+             (plist-get file-result :file)
+             (plist-get file-result :passed)
+             (plist-get file-result :total)
+             (if (plist-get file-result :ok) "OK  " "FAIL")
+             (plist-get file-result :elapsed-ms))
+    (unless (plist-get file-result :ok)
+      (message "\n--- %s failure output ---\n%s--- end %s failure output ---"
+               (plist-get file-result :file)
+               (anvil-dev--failure-output-for-report
+                (plist-get file-result :output))
+               (plist-get file-result :file))))
+  (message "-- totals: %d files, %d/%d tests, %d failed tests in %d files, %.1fs --"
+           (plist-get result :file-count)
+           (plist-get result :passed)
+           (plist-get result :total)
+           (plist-get result :failed)
+           (plist-get result :failed-file-count)
+           (/ (plist-get result :elapsed-ms) 1000.0)))
+
+(defun anvil-dev--batch-exit-status (result)
+  "Return nonzero when any subprocess in aggregate RESULT failed."
+  (if (null (plist-get result :failed-files)) 0 1))
+
 ;;;###autoload
 (defun anvil-dev-test-run-all-batch ()
   "Batch entry point: run all tests and exit 0 on green, 1 on any failure.
 Invoke as `emacs --batch -L . -l anvil-dev -f anvil-dev-test-run-all-batch'."
   (let ((result (anvil-dev-test-run-all default-directory)))
-    (message "\n== anvil test-run-all ==")
-    (dolist (r (plist-get result :per-file))
-      (message "  %-38s %d/%d  %s  %dms"
-               (plist-get r :file)
-               (plist-get r :passed)
-               (plist-get r :total)
-               (if (plist-get r :ok) "OK  " "FAIL")
-               (plist-get r :elapsed-ms)))
-    (message "-- totals: %d files, %d/%d tests, %d failed, %.1fs --"
-             (plist-get result :file-count)
-             (plist-get result :passed)
-             (plist-get result :total)
-             (plist-get result :failed)
-             (/ (plist-get result :elapsed-ms) 1000.0))
-    (kill-emacs (if (zerop (plist-get result :failed)) 0 1))))
+    (anvil-dev--report-batch-result result)
+    (kill-emacs (anvil-dev--batch-exit-status result))))
 
 (defun anvil-dev--tool-test-run-all (&optional project-dir minimal)
   "MCP wrapper for `anvil-dev-test-run-all'.

@@ -1174,7 +1174,8 @@ org スキャン、フルツリー検索）はメインデーモンで実行し�
 
 - shell コマンドには `shell-run` を使う。stdout が自動filterされ、
   圧縮済みstdoutと `tee-id` が返る。圧縮表示で足りない場合だけ
-  `shell-tee-get` で raw stdout を復元する。
+  `shell-tee-get` で上限付きの raw stdout prefix を復元する。
+  本当に大きな出力はファイルへredirectする。
 - shell以外の長文には `context-compress` を使う。API JSON、RAG snippet、
   Web/article抽出、別tool由来のlog、diff、code断片が対象。後で原文が
   必要になりそうなら `store=true` にし、返ってきた `ccr-id` を

@@ -62,8 +62,9 @@ rtk は *Claude Code の Bash PreToolUse hook* で =git status= を
 1. 20-30 の common command に per-command filter を用意 (rtk は
    100+、anvil は Emacs + 電気管理用途に絞った subset)。
 2. Filter は pure Emacs Lisp (外部 binary 不要、Windows でも動く)。
-3. 失敗時 (exit code ≠ 0 or regex 検出) は *raw 全文を =anvil-state=
-   に tee*、 =shell-tee-get <id>= で再読可能に。
+3. 失敗時 (exit code ≠ 0 or regex 検出) は *bounded raw prefix を
+   =anvil-state= に tee*、 =shell-tee-get <id>= で再読可能に。
+   完全な出力が必要な場合は command 側で file に redirect する。
 4. =anvil-pty-broker= の long-running 出力にも適用可能 (ring buffer
    tail に filter 適用)。
 5. =shell-gain= tool で節約量 (local 計測) を累積、ユーザーが ROI
@@ -167,12 +168,14 @@ handler 無しは raw passthrough + tee のみ。
 
 ** Tee 戦略
 
-全ての filter 呼び出しは (成否によらず) raw 出力を
+全ての filter 呼び出しは (成否によらず) raw 出力の上限付き prefix を
 =anvil-state-set= で =(:ns "shell-tee" :key TEE-ID)= に保存。
-TTL は =anvil-shell-tee-ttl-sec= (default 3600 秒 = 1h)。
+上限は =anvil-shell-tee-max-bytes=、TTL は
+=anvil-shell-tee-ttl-sec= (default 3600 秒 = 1h)。
 
-=shell-tee-get= MCP tool で TEE-ID を指定すれば raw を取り戻せる
-(LLM が圧縮しすぎと判断したときの retry path)。
+=shell-tee-get= MCP tool で TEE-ID を指定すれば上限内の raw を取り戻せる
+(LLM が圧縮しすぎと判断したときの retry path)。巨大出力は file
+redirect を使う。
 
 =anvil-state-prune= が既に TTL 管理を持つので、追加実装不要。
 
@@ -329,7 +332,7 @@ User-defined filter (=~/.emacs.d/anvil-shell-filters.el= で
   置く。
 - Property: compressed が raw の subset になっていること
   (token savings ≥ 50%)。
-- Tee round-trip: filter → shell-tee-get で raw を復元できる。
+- Tee round-trip: filter → shell-tee-get で上限内の raw を復元できる。
 - Idempotency: filter を二度掛けても結果が安定。
 
 * Platform notes

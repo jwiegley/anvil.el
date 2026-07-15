@@ -2097,6 +2097,74 @@
       (advice-remove 'make-process wrapper)
       (advice-remove 'run-at-time wrapper))))
 
+(ert-deftest anvil-host-reentrancy-stdout-capture-is-bounded-and-recovers ()
+  "A noisy stdout child is retired at the cap and the next run succeeds."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (let ((anvil-host--absolute-max-output-bytes 4096)
+        (anvil-host--cleanup-state
+         (cons nil (make-hash-table :test #'eq)))
+        (anvil-host--cleanup-timer nil)
+        (anvil-host--cleanup-active nil))
+    (unwind-protect
+        (let (failure)
+          (condition-case error
+              (anvil-host--run
+               (concat "i=0; while [ \"$i\" -lt 257 ]; do "
+                       "printf 0123456789abcdef; i=$((i + 1)); done; "
+                       "sleep 30")
+               'utf-8-unix nil 5)
+            (error (setq failure (error-message-string error))))
+          (should (string-match-p "stdout exceeded the 4096-byte capture limit"
+                                  failure))
+          (anvil-host-reentrancy-test--wait-for-cleanup 1)
+          (anvil-host-reentrancy-test--assert-clean nil nil)
+          (should
+           (equal '(0 "recovered" "")
+                  (anvil-host--run
+                   "printf recovered" 'utf-8-unix nil 2)))
+          (anvil-host-reentrancy-test--assert-clean nil nil))
+      (anvil-host-reentrancy-test--force-clean nil nil))))
+
+(ert-deftest anvil-host-reentrancy-stderr-capture-is-bounded-and-recovers ()
+  "A noisy stderr child is retired at the cap and the next run succeeds."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (let ((anvil-host--absolute-max-output-bytes 4096)
+        (anvil-host--cleanup-state
+         (cons nil (make-hash-table :test #'eq)))
+        (anvil-host--cleanup-timer nil)
+        (anvil-host--cleanup-active nil))
+    (unwind-protect
+        (let (failure)
+          (condition-case error
+              (anvil-host--run
+               (concat "i=0; while [ \"$i\" -lt 257 ]; do "
+                       "printf 0123456789abcdef >&2; i=$((i + 1)); done; "
+                       "sleep 30")
+               'utf-8-unix nil 5)
+            (error (setq failure (error-message-string error))))
+          (should (string-match-p "stderr exceeded the 4096-byte capture limit"
+                                  failure))
+          (anvil-host-reentrancy-test--wait-for-cleanup 1)
+          (anvil-host-reentrancy-test--assert-clean nil nil)
+          (should
+           (equal '(0 "recovered" "")
+                  (anvil-host--run
+                   "printf recovered" 'utf-8-unix nil 2)))
+          (anvil-host-reentrancy-test--assert-clean nil nil))
+      (anvil-host-reentrancy-test--force-clean nil nil))))
+
+(ert-deftest anvil-host-reentrancy-capture-accepts-the-exact-byte-limit ()
+  "The hard capture boundary is inclusive and becomes sticky after overflow."
+  (let ((anvil-host--absolute-max-output-bytes 5)
+        (state (vector nil 0 nil)))
+    (anvil-host--capture-output-chunk state (unibyte-string ?a ?b ?c ?d ?e))
+    (should (= 5 (aref state 1)))
+    (should-not (aref state 2))
+    (should (equal "abcde" (anvil-host--captured-output state)))
+    (anvil-host--capture-output-chunk state (unibyte-string ?f))
+    (should (= 5 (aref state 1)))
+    (should (aref state 2))))
+
 (ert-deftest anvil-host-reentrancy-zz-global-state-remains-clean ()
   "Focused and full runs leave no hidden host custody state."
   (should (zerop (anvil-host--retired-count)))

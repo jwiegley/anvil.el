@@ -569,9 +569,24 @@
   "`--truncate-line' wraps oversized strings with elision sentinel."
   (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
   (should (equal (anvil-shell-filter--truncate-line "abc" 10) "abc"))
+  (should (equal (anvil-shell-filter--truncate-line "abc" 0) ""))
   (let ((out (anvil-shell-filter--truncate-line (make-string 200 ?y) 60)))
-    (should (< (length out) 80))
-    (should (string-match-p "…(140 bytes elided)\\'" out))))
+    (should (<= (string-bytes out) 60))
+    (should (string-match-p "…(161 bytes elided)\\'" out)))
+  (let ((out (anvil-shell-filter--truncate-line "abcéé" 4)))
+    (should (equal "a…" out))
+    (should (= 4 (string-bytes out)))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-rejects-negative-budgets ()
+  "Invalid grep budgets fail before starting the shell child."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
+  (cl-letf (((symbol-function 'anvil-shell)
+             (lambda (&rest _args)
+               (ert-fail "invalid tee-grep budget reached the host runner"))))
+    (dolist (opts '((:max-line-bytes -1) (:tail-fallback -1)))
+      (should-error
+       (apply #'anvil-shell-filter-tee-grep "printf no" :grep "x" opts)
+       :type 'error))))
 
 (ert-deftest anvil-shell-filter-test/tee-grep-end-to-end ()
   "End-to-end: shell echo + grep + tee + match-count + raw retrieval."
@@ -830,13 +845,25 @@ Pipeline order under test:
   "Tee-put truncates raw when it exceeds `anvil-shell-tee-max-bytes'."
   (skip-unless (anvil-shell-filter-test--supported-p 'tee))
   (anvil-shell-filter-test--with-state
-    (let* ((anvil-shell-tee-max-bytes 32)
+    (let* ((anvil-shell-tee-max-bytes 64)
            (raw (concat (make-string 200 ?x) "TAIL"))
            (id (anvil-shell-filter--tee-put raw))
            (got (anvil-shell-filter-tee-get id)))
       (should (stringp got))
       (should (string-match-p "anvil-shell-tee: truncated" got))
+      (should (<= (string-bytes got) anvil-shell-tee-max-bytes))
       (should (< (length got) (length raw))))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-zero-cap-stores-nothing ()
+  "A zero-byte tee cap remains a strict storage bound."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 0)
+           (id (anvil-shell-filter--tee-put "content")))
+      (should (equal "" (anvil-shell-filter-tee-get id)))))
+  (dolist (cap '(-1 4.0 "4" invalid))
+    (let ((anvil-shell-tee-max-bytes cap))
+      (should-error (anvil-shell-filter--tee-put "content") :type 'error))))
 
 (ert-deftest anvil-shell-filter-test/tee-put-cap-nil-keeps-full ()
   "Setting `anvil-shell-tee-max-bytes' to nil disables capping."
@@ -847,6 +874,42 @@ Pipeline order under test:
            (id (anvil-shell-filter--tee-put raw))
            (got (anvil-shell-filter-tee-get id)))
       (should (equal raw got)))))
+
+(ert-deftest anvil-shell-filter-test/host-cap-allows-tee-truncation ()
+  "Finite output above the tee cap remains bounded and retrievable."
+  (skip-unless (and (memq system-type '(gnu/linux darwin))
+                    (anvil-shell-filter-test--supported-p 'tee)))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-host--absolute-max-output-bytes 4096)
+           (anvil-shell-tee-max-bytes 1024)
+           (command
+            (concat "i=0; while [ \"$i\" -lt 128 ]; do "
+                    "printf 0123456789abcdef; i=$((i + 1)); done"))
+           (result (anvil-shell-filter-run command :filter nil :timeout 5))
+           (raw (anvil-shell-filter-tee-get (plist-get result :tee-id))))
+      (should (= 0 (plist-get result :exit)))
+      (should (= 2048 (plist-get result :raw-size)))
+      (should-not (plist-get result :truncated))
+      (should (= 1024 (string-bytes raw)))
+      (should (string-match-p "anvil-shell-tee: truncated" raw)))))
+
+(ert-deftest anvil-shell-filter-test/byte-counts-preserve-multibyte-text ()
+  "Tee caps and result sizes use bytes without splitting characters."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 4)
+           (raw "café")
+           (id (anvil-shell-filter--tee-put raw))
+           (stored (anvil-shell-filter-tee-get id)))
+      (should (equal "c…" stored))
+      (should (= 4 (string-bytes stored))))
+    (cl-letf (((symbol-function 'anvil-shell)
+               (lambda (_cmd _opts)
+                 '(:exit 0 :stdout "café" :stderr "é"))))
+      (let ((result
+             (anvil-shell-filter-run "printf" :filter nil :timeout 5)))
+        (should (= 5 (plist-get result :raw-size)))
+        (should (= 5 (plist-get result :compressed-size)))))))
 
 
 ;;;; --- §7.1 trace events ------------------------------------------------

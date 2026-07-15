@@ -40,10 +40,10 @@
 ;;   shell-tee-get   — fetch raw text by tee-id
 ;;   shell-gain      — cumulative savings summary (last N days)
 ;;
-;; Raw output is always stored (win or lose) under the `shell-tee'
-;; namespace with a TTL so the LLM can reach back for the full bytes
-;; when the compressed form hides something material.  `anvil-state'
-;; handles TTL pruning; no separate sweep is required.
+;; A bounded raw prefix is stored (win or lose) under the `shell-tee'
+;; namespace with a TTL so the LLM can recover local context when the
+;; compressed form hides something material.  `anvil-state' handles TTL
+;; pruning; no separate sweep is required.
 ;;
 ;; The module lives in `anvil-optional-modules' because it depends on
 ;; `anvil-state' (Emacs 29+ SQLite) and adds several user-facing MCP
@@ -102,14 +102,15 @@ same list so each test can self-describe its capability gate.")
   :group 'anvil-shell-filter)
 
 (defcustom anvil-shell-tee-max-bytes (* 4 1024 1024)
-  "Maximum bytes stored per shell-run tee entry.
+  "Maximum total bytes stored per shell-run tee entry.
 Larger raw stdout is truncated with a sentinel before storage
 in `anvil-state'.  Caps the per-call cost of
 `anvil-shell-filter--tee-put' and prevents unbounded growth of
 `anvil-state.db' when commands emit large output (e.g. cargo
-test logs).  Set to nil to disable capping (the historical
-behaviour).  `anvil-shell-filter-tee-get' returns the capped
-string; for genuinely large output prefer file redirection."
+test logs).  Set to nil to disable this storage cap (the historical
+behaviour); the host runner's absolute 16 MiB stream ceiling still
+applies.  `anvil-shell-filter-tee-get' returns the capped string;
+for genuinely large output prefer file redirection."
   :type '(choice integer (const :tag "No cap" nil))
   :group 'anvil-shell-filter)
 
@@ -226,8 +227,8 @@ Non-zero exits bypass this threshold because their tail is often useful."
     "^E[[:space:]]+"
     "^[[:space:]]*at .*(.*:[0-9]+)")
   "Case-insensitive regexps whose matching stdout lines are always kept.
-These patterns are intentionally conservative.  Raw stdout is still tee'd
-by `shell-run', so callers can recover the full output if needed."
+These patterns are intentionally conservative.  `shell-run' also stores a
+bounded raw prefix so callers can recover omitted local context when needed."
   :type '(repeat regexp)
   :group 'anvil-shell-filter)
 
@@ -1081,13 +1082,19 @@ now.  No-op when `anvil-shell-filter-trace-events' is nil."
 When `anvil-shell-tee-max-bytes' is non-nil and RAW exceeds it,
 the stored value is truncated with a sentinel so `anvil-state.db'
 cannot grow unboundedly per invocation."
-  (let* ((id (anvil-shell-filter--new-id))
-         (cap anvil-shell-tee-max-bytes)
-         (capped (if (and (integerp cap) (> (length raw) cap))
-                     (concat (substring raw 0 cap)
-                             (format "\n…[anvil-shell-tee: truncated %d bytes]"
-                                     (- (length raw) cap)))
-                   raw)))
+  (let* ((cap anvil-shell-tee-max-bytes)
+         (_ (unless (or (null cap)
+                        (and (integerp cap) (>= cap 0)))
+              (error
+               "anvil-shell-tee-max-bytes must be nil or a nonnegative integer")))
+         (id (anvil-shell-filter--new-id))
+         (capped
+          (if (integerp cap)
+              (anvil-host--truncate-with-marker
+               raw cap
+               (lambda (omitted)
+                 (format "\n…[anvil-shell-tee: truncated %d bytes]" omitted)))
+            raw)))
     (anvil-state-set id capped
                      :ns anvil-shell-filter--tee-ns
                      :ttl anvil-shell-tee-ttl-sec)
@@ -1186,9 +1193,8 @@ Returns a plist:
   :stderr           raw stderr (never compressed)
   :truncated        non-nil when `anvil-shell' truncated the buffers
 
-Raw stdout is always tee'd so callers can fetch the full output
-via `anvil-shell-filter-tee-get' when compression hid material
-detail."
+Raw stdout is tee'd up to `anvil-shell-tee-max-bytes' so callers can
+recover material hidden by compression without growing state unboundedly."
   (let* ((trace-id (and anvil-shell-filter-trace-events
                         (anvil-shell-filter--trace-new-id)))
          (trace-start (and trace-id (current-time)))
@@ -1227,8 +1233,8 @@ detail."
                            (anvil-shell-filter-apply resolved raw)))
            (_ (when trace-id
                 (anvil-shell-filter--trace trace-id "filter-done" trace-start)))
-           (raw-size (length raw))
-           (compressed-size (length compressed))
+           (raw-size (string-bytes raw))
+           (compressed-size (string-bytes compressed))
            (tee-id (anvil-shell-filter--tee-put raw))
            (_ (when trace-id
                 (anvil-shell-filter--trace trace-id "tee-done" trace-start))))
@@ -1250,11 +1256,12 @@ detail."
 
 (defun anvil-shell-filter--truncate-line (line max-bytes)
   "Return LINE truncated to MAX-BYTES (with elision sentinel) when longer."
-  (if (or (null max-bytes) (zerop max-bytes) (<= (length line) max-bytes))
+  (if (or (null max-bytes)
+          (<= (string-bytes line) max-bytes))
       line
-    (format "%s…(%d bytes elided)"
-            (substring line 0 (max 1 (- max-bytes 24)))
-            (- (length line) max-bytes))))
+    (anvil-host--truncate-with-marker
+     line max-bytes
+     (lambda (omitted) (format "…(%d bytes elided)" omitted)))))
 
 (defun anvil-shell-filter--grep-lines (raw regex max-line-bytes tail-fallback)
   "Return lines from RAW that match REGEX, each truncated to MAX-LINE-BYTES.
@@ -1282,8 +1289,8 @@ When zero lines match, return the last TAIL-FALLBACK lines instead."
 (defun anvil-shell-filter-tee-grep (cmd &rest opts)
   "Run shell CMD, return only stdout lines matching `:grep' regex.
 Each retained line is truncated to `:max-line-bytes' (default
-`anvil-shell-tee-grep-default-max-line-bytes').  Raw stdout is always
-tee'd so callers can fetch the full output via `shell-tee-get'.
+`anvil-shell-tee-grep-default-max-line-bytes').  Raw stdout is tee'd up to
+`anvil-shell-tee-max-bytes' for bounded follow-up via `shell-tee-get'.
 
 OPTS plist:
   :grep             regex; lines that don't match are dropped (required)
@@ -1310,6 +1317,10 @@ Returns a plist:
          (tail-fallback (let ((v (plist-get opts :tail-fallback)))
                           (if (numberp v) v
                             anvil-shell-tee-grep-default-tail-fallback)))
+         (_ (unless (and (integerp max-line-bytes) (>= max-line-bytes 0))
+              (error ":max-line-bytes must be a nonnegative integer")))
+         (_ (unless (and (integerp tail-fallback) (>= tail-fallback 0))
+              (error ":tail-fallback must be a nonnegative integer")))
          (timeout
           (anvil-shell-filter--bounded-sync-timeout
            (or (plist-get opts :timeout)
@@ -1325,8 +1336,8 @@ Returns a plist:
                        raw grep max-line-bytes tail-fallback))
          (used-fallback (car grep-result))
          (compressed (cdr grep-result))
-         (raw-size (length raw))
-         (compressed-size (length compressed))
+         (raw-size (string-bytes raw))
+         (compressed-size (string-bytes compressed))
          (tee-id (anvil-shell-filter--tee-put raw))
          (match-count (length (split-string compressed "\n" nil))))
     (anvil-shell-filter--gain-record 'tee-grep raw-size compressed-size)
@@ -1361,8 +1372,8 @@ MCP Parameters:
   cwd         - Optional working directory for the shell invocation.
 
 Returns (:exit :filter :compressed :raw-size :compressed-size
-:tee-id :stderr :truncated).  Raw stdout is always saved under
-the tee namespace so a follow-up `shell-tee-get' can recover it."
+:tee-id :stderr :truncated).  A bounded raw prefix is saved under
+the tee namespace for follow-up through `shell-tee-get'."
   (anvil-server-with-error-handling
    (let* ((filter-tag (cond
                        ((null filter) 'auto)
@@ -1397,8 +1408,8 @@ a prior tee-get) can re-compress without re-running the shell."
           (compressed (anvil-shell-filter-apply filter-tag raw*)))
      (list :filter filter-tag
            :compressed compressed
-           :raw-size (length raw*)
-           :compressed-size (length compressed)))))
+           :raw-size (string-bytes raw*)
+           :compressed-size (string-bytes compressed)))))
 
 (defun anvil-shell-filter--tool-shell-tee-get (tee_id)
   "Retrieve raw stdout previously stored under TEE_ID.
@@ -1429,8 +1440,8 @@ MCP Parameters:
   cwd             - Optional working directory.
 
 Returns (:exit :compressed :raw-size :compressed-size :match-count
-:used-fallback :tee-id :stderr :truncated).  Raw stdout is always
-saved under the tee namespace; recover via `shell-tee-get'."
+:used-fallback :tee-id :stderr :truncated).  A bounded raw prefix is
+saved under the tee namespace; recover it via `shell-tee-get'."
   (anvil-server-with-error-handling
    (let* ((max-line (anvil-shell-filter--coerce-int
                      max_line_bytes
@@ -1468,7 +1479,7 @@ MCP Parameters:
      :description
      "Run a shell command, compress its stdout through a per-command filter
 (git-status, git-log, git-diff, rg, find, ls, pytest, ert-batch,
-emacs-batch, make), and save the raw output to the tee namespace
+emacs-batch, make), and save a bounded raw prefix to the tee namespace
 for later retrieval via `shell-tee-get'.  `filter=auto' picks a
 handler from the first token of CMD; `filter=\"\"` disables
 compression.")
@@ -1488,7 +1499,7 @@ callers re-compress output they already have (from a prior
      :intent '(shell)
      :layer 'io
      :description
-     "Fetch raw stdout previously captured by `shell-run' under TEE_ID.
+     "Fetch bounded raw stdout captured by `shell-run' under TEE_ID.
 Retention is governed by `anvil-shell-tee-ttl-sec' (default 1h);
 expired ids return :found nil."
      :read-only t)
@@ -1499,8 +1510,8 @@ expired ids return :found nil."
      :layer 'io
      :description
      "Run a shell command, drop stdout lines that don't match GREP regex,
-truncate each retained line to MAX_LINE_BYTES (default 200), and tee
-the raw stdout for later retrieval via `shell-tee-get'.  When zero
+truncate each retained line to MAX_LINE_BYTES (default 200), and tee a
+bounded raw prefix for later retrieval via `shell-tee-get'.  When zero
 lines match GREP, falls back to the last TAIL_FALLBACK lines (default
 50) so the caller never gets an empty result by accident.  Designed
 for `make bench-actual', `cargo test', `pytest', etc — extract just

@@ -310,9 +310,9 @@ These are not loaded by default.  Available modules:
                 transparently filter verbose stdout (git status /
                 git log / git diff / rg / find / ls / pytest /
                 ert-batch / emacs-batch / make) before returning
-                to the caller.  Raw bytes are stashed under the
-                `shell-tee' namespace with a TTL so callers can
-                recover the full output on demand.  Requires
+                to the caller.  A bounded raw prefix is stashed under
+                the `shell-tee' namespace with a TTL; redirect very
+                large output to a file when complete capture matters.  Requires
                 `anvil-state' (Emacs 29+ SQLite).  Doc 27 Phase 1.
 - `context'   — Headroom-inspired reversible context compression for
                 arbitrary tool outputs / RAG snippets / JSON payloads /

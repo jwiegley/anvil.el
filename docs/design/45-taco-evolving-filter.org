@@ -20,8 +20,9 @@ Layer 2/3 (進化・グローバルプール) は別 Phase。
   stdout だけを対象に、error / Traceback / FAILED / fatal / panic 等の
   critical 行 + 前後 context + non-zero exit の末尾を保持する。
   =shell-run= の =:filter auto= 内部でのみ発火し、短い clean 出力や
-  critical signal の無い出力は raw passthrough。raw stdout は従来通り
-  tee に保存され、必要なら =shell-tee-get= で完全復元できる。
+  critical signal の無い出力は raw passthrough。raw stdout は bounded
+  prefix だけ tee に保存され、=shell-tee-get= で再読できる。完全な
+  出力が必要な場合は command 側で file に redirect する。
   defcustom: =anvil-shell-filter-taco-critical-fallback= /
   =-min-lines= / =-context-lines= / =-tail-lines= / =-patterns=。
   ERT: =anvil-shell-filter-test= 57/57 green、byte-compile 0 warning。

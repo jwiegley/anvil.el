@@ -253,6 +253,14 @@ Non-git `call-process' calls still signal exit-status 1."
 
 ;;;; --- run-one-test-file (integration, tiny) -------------------------------
 
+(ert-deftest anvil-dev-test-emacs-bin-defaults-to-current-executable ()
+  "The runner stays hermetic when the parent Emacs is absent from PATH."
+  (let ((current
+         (expand-file-name invocation-name invocation-directory)))
+    (should (file-executable-p anvil-dev-emacs-bin))
+    (should (equal (file-truename current)
+                   (file-truename anvil-dev-emacs-bin)))))
+
 (ert-deftest anvil-dev-test-run-one-file-parses-counts ()
   "End-to-end: write a trivial test file, run it, assert parsed counts."
   (let ((d (anvil-dev-test--make-dir)))
@@ -269,8 +277,52 @@ Non-git `call-process' calls still signal exit-status 1."
             (should (plist-get r :ok))
             (should (equal 2 (plist-get r :total)))
             (should (equal 2 (plist-get r :passed)))
-            (should (equal 0 (plist-get r :failed)))))
+            (should (equal 0 (plist-get r :failed)))
+            (should-not (plist-get r :output))))
       (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-run-one-file-bounds-errors-and-recovers ()
+  "Timeout and overflow errors stay bounded and do not poison the next file."
+  (let ((root (make-temp-file "anvil-dev-runner-errors-" t))
+        (anvil-dev-failure-output-max-bytes 96)
+        (responses
+         (list
+          '(error "anvil-host: shell timeout after 1s")
+          '(error "anvil-host: stdout exceeded 16777216 byte capture limit")
+          (list 'return 0
+                (concat (make-string 200 ?x)
+                        "\nRan 1 test, 1 result as expected, 0 unexpected\n")
+                ""))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'anvil-host--run)
+                   (lambda (&rest _arguments)
+                     (pcase (pop responses)
+                       (`(error ,message) (error "%s" message))
+                       (`(return ,exit ,stdout ,stderr)
+                        (list exit stdout stderr))))))
+          (dolist (needle '("shell timeout" "capture limit"))
+            (let ((result
+                   (anvil-dev--run-one-test-file
+                    "/tmp/anvil-runner-error-test.el" root)))
+              (should-not (plist-get result :ok))
+              (should (= 70 (plist-get result :exit)))
+              (should (<= (string-bytes (plist-get result :output)) 96))
+              (should (string-match-p needle (plist-get result :output)))))
+          (let ((result
+                 (anvil-dev--run-one-test-file
+                  "/tmp/anvil-runner-recovery-test.el" root)))
+            (should (plist-get result :ok))
+            (should (= 1 (plist-get result :passed)))
+            (should-not (plist-get result :output))))
+      (delete-directory root t))))
+
+(ert-deftest anvil-dev-test-combine-output-labels-stream-seam ()
+  "Simultaneous stdout and stderr cannot concatenate without a boundary."
+  (should
+   (equal "--- stdout ---\npartial\n--- stderr ---\nDebugger"
+          (anvil-dev--combine-test-output "partial" "Debugger")))
+  (should (equal "stdout" (anvil-dev--combine-test-output "stdout" "")))
+  (should (equal "stderr" (anvil-dev--combine-test-output "" "stderr"))))
 
 ;;;; --- release audit -----------------------------------------------------
 
@@ -615,6 +667,79 @@ picking up the status line itself."
               (should (= 3 (plist-get r :total)))
               (should (= 3 (plist-get r :passed)))))
         (delete-directory default-directory t)))))
+
+(ert-deftest anvil-dev-test-batch-report-retains-failure-diagnostics ()
+  "Batch summaries print failed-file output without echoing green logs."
+  (let ((result
+         (list :file-count 2 :total 3 :passed 2 :failed 1
+               :failed-file-count 1 :failed-files '("anvil-red-test.el")
+               :elapsed-ms 1000
+               :per-file
+               (list
+                (list :file "anvil-green-test.el" :ok t :total 2 :passed 2
+                      :failed 0 :elapsed-ms 400 :output "green-noise")
+                (list :file "anvil-red-test.el" :ok nil :total 1 :passed 0
+                      :failed 1 :elapsed-ms 600 :output "retained-backtrace\n"))))
+        messages)
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest arguments)
+                 (push (apply #'format format-string arguments) messages))))
+      (anvil-dev--report-batch-result result))
+    (let ((report (mapconcat #'identity (nreverse messages) "\n")))
+      (should (string-match-p "retained-backtrace" report))
+      (should (string-match-p "anvil-red-test\\.el failure output" report))
+      (should-not (string-match-p "green-noise" report)))))
+
+(ert-deftest anvil-dev-test-failure-output-is-a-strict-head-tail-budget ()
+  "Failure diagnostics stay within every byte cap for text and raw bytes."
+  (dolist (raw
+           (list
+            (concat "head-" (make-string 180 ?x) "-漢🙂-tail")
+            (apply #'unibyte-string (make-list 180 255))))
+    (dolist (cap (number-sequence 0 256))
+      (let ((bounded (anvil-dev--bounded-failure-output raw cap)))
+        (should (<= (string-bytes bounded) cap)))))
+  (let ((bounded
+         (anvil-dev--bounded-failure-output
+          (concat "HEAD" (make-string 400 ?x) "TAIL") 96)))
+    (should (string-prefix-p "HEAD" bounded))
+    (should (string-suffix-p "TAIL" bounded))
+    (should (string-match-p "bytes omitted" bounded))))
+
+(ert-deftest anvil-dev-test-failure-output-has-one-delimiter-newline ()
+  "Empty, unterminated, and newline-terminated logs get one separator."
+  (let ((anvil-dev-failure-output-max-bytes 1024))
+    (should (equal "\n" (anvil-dev--failure-output-for-report "")))
+    (should (equal "plain\n"
+                   (anvil-dev--failure-output-for-report "plain")))
+    (should (equal "plain\n"
+                   (anvil-dev--failure-output-for-report "plain\n\n")))))
+
+(ert-deftest anvil-dev-test-batch-exit-fails-on-summary-free-load-errors ()
+  "A subprocess failure is red even when ERT produced no parsed test count."
+  (should (= 1 (anvil-dev--batch-exit-status
+                (list :failed 0 :failed-files '("anvil-load-error-test.el")))))
+  (should (= 0 (anvil-dev--batch-exit-status
+                (list :failed 0 :failed-files nil)))))
+
+(ert-deftest anvil-dev-test-aggregate-counts-summary-free-file-failures ()
+  "Aggregation records a red subprocess even with zero parsed ERT failures."
+  (let ((root (make-temp-file "anvil-dev-summary-free-" t)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'anvil-dev--discover-test-files)
+                   (lambda (_root) '("/tmp/anvil-load-error-test.el")))
+                  ((symbol-function 'anvil-dev--run-one-test-file)
+                   (lambda (_file _root)
+                     (list :file "anvil-load-error-test.el" :ok nil :exit 70
+                           :total 0 :passed 0 :failed 0 :skipped 0
+                           :elapsed-ms 1 :output "load error"))))
+          (let ((result (anvil-dev-test-run-all root)))
+            (should (= 0 (plist-get result :failed)))
+            (should (= 1 (plist-get result :failed-file-count)))
+            (should (equal '("anvil-load-error-test.el")
+                           (plist-get result :failed-files)))
+            (should (= 1 (anvil-dev--batch-exit-status result)))))
+      (delete-directory root t))))
 
 ;;;; --- plist-return scanner (v0.3.1-class regression guard) --------------
 

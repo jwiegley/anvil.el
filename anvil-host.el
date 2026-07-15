@@ -88,7 +88,13 @@
   "Default timeout (seconds) for `anvil-shell'.")
 
 (defconst anvil-host--default-max-output 16384
-  "Default max output bytes captured per stream by `anvil-shell'.")
+  "Default max output bytes returned per stream by `anvil-shell'.")
+
+(defconst anvil-host--absolute-max-output-bytes (* 16 1024 1024)
+  "Hard in-flight capture ceiling for each host-child output stream.
+This bound applies even when `anvil-shell' receives `:max-output nil'.  A
+child that exceeds it is retired immediately instead of letting the root
+Emacs accumulate output until its presentation or tee layer runs.")
 
 (defconst anvil-host--stderr-drain-budget-sec 0.2
   "Seconds to drain the stderr pipe-proc after the main proc exits.
@@ -136,12 +142,59 @@ on Japanese Windows. Other OSes default to utf-8."
 
 ;;;; --- internal: shell run ------------------------------------------------
 
+(defun anvil-host--short-truncation (string max-bytes)
+  "Return a visibly truncated form of STRING within tiny MAX-BYTES."
+  (cond
+   ((<= max-bytes 0) "")
+   ((< max-bytes 3) (make-string max-bytes ?.))
+   (t
+    (let ((low 0)
+          (high (length string))
+          best)
+      ;; Concatenating a unibyte prefix with the multibyte marker can promote
+      ;; high byte8 characters and increase their encoded size.  Measure the
+      ;; final candidate rather than budgeting the two strings independently.
+      (while (<= low high)
+        (let* ((middle (/ (+ low high) 2))
+               (candidate (concat (substring string 0 middle) "…")))
+          (if (<= (string-bytes candidate) max-bytes)
+              (setq best candidate
+                    low (1+ middle))
+            (setq high (1- middle)))))
+      (or best (make-string max-bytes ?.))))))
+
+(defun anvil-host--truncate-with-marker (string max-bytes marker-function)
+  "Truncate STRING to MAX-BYTES using MARKER-FUNCTION.
+MARKER-FUNCTION receives the exact number of omitted source bytes.  Preserve
+whole characters and include the marker inside the byte budget.  Tiny budgets
+that cannot hold the full marker receive a short visible truncation instead."
+  (let ((total-bytes (string-bytes string)))
+    (if (<= total-bytes max-bytes)
+        string
+      (let ((low 0)
+            (high (length string))
+            best)
+        (while (<= low high)
+          (let* ((middle (/ (+ low high) 2))
+                 (prefix (substring string 0 middle))
+                 (prefix-bytes (string-bytes prefix))
+                 (omitted (- total-bytes prefix-bytes))
+                 (candidate
+                  (concat prefix (funcall marker-function omitted))))
+            (if (<= (string-bytes candidate) max-bytes)
+                (setq best candidate
+                      low (1+ middle))
+              (setq high (1- middle)))))
+        (or best (anvil-host--short-truncation string max-bytes))))))
+
 (defun anvil-host--truncate (str max)
-  "Truncate STR to MAX bytes, append a marker if cut."
-  (if (and (numberp max) (> (length str) max))
-      (concat (substring str 0 max)
-              (format "\n...[anvil-host: truncated, %d more bytes]"
-                      (- (length str) max)))
+  "Truncate STR to MAX bytes without splitting a character.
+Append a marker reporting the exact number of omitted bytes when cut."
+  (if (and (numberp max) (> (string-bytes str) max))
+      (anvil-host--truncate-with-marker
+       str max
+       (lambda (omitted)
+         (format "\n...[anvil-host: truncated, %d more bytes]" omitted)))
     str))
 
 (defun anvil-host--scheduled-timers ()
@@ -702,6 +755,39 @@ a successful valid constructor may create unrelated helper processes."
       (decode-coding-string bytes coding)
     (anvil-host--scrub-code-conversion-work-buffer)))
 
+(defun anvil-host--capture-output-chunk (state chunk)
+  "Append binary CHUNK to bounded capture STATE.
+STATE is a private vector of reversed chunks, retained bytes, and an overflow
+bit.  Once the absolute ceiling is crossed, retain only the prefix needed to
+reach it and discard every later byte until the transaction notices the bit."
+  (let* ((size (length chunk))
+         (captured (aref state 1))
+         (remaining (- anvil-host--absolute-max-output-bytes captured)))
+    (when (> size 0)
+      (if (<= size remaining)
+          (progn
+            (aset state 0 (cons chunk (aref state 0)))
+            (aset state 1 (+ captured size)))
+        (when (> remaining 0)
+          (aset state 0
+                (cons (substring chunk 0 remaining) (aref state 0)))
+          (aset state 1 anvil-host--absolute-max-output-bytes))
+        (aset state 2 t)))))
+
+(defun anvil-host--check-output-capture (stdout-state stderr-state)
+  "Fail when STDOUT-STATE or STDERR-STATE crossed the absolute ceiling."
+  (cond
+   ((aref stdout-state 2)
+    (error "anvil-host: stdout exceeded the %d-byte capture limit"
+           anvil-host--absolute-max-output-bytes))
+   ((aref stderr-state 2)
+    (error "anvil-host: stderr exceeded the %d-byte capture limit"
+           anvil-host--absolute-max-output-bytes))))
+
+(defun anvil-host--captured-output (state)
+  "Return the bounded binary output retained in capture STATE."
+  (apply #'concat (reverse (aref state 0))))
+
 (defun anvil-host--detach-constructor-processes (processes)
   "Detach exact constructor PROCESSES from every discoverable output buffer."
   (dolist (process (cl-delete-duplicates processes :test #'eq))
@@ -733,11 +819,12 @@ post-exit draining prevent inherited descriptors from retaining the call.
 
 Output is accumulated in lexical filter state rather than discoverable
 buffers.  Request-specific child bindings are present only during spawn.
-Waits target this shell for return semantics while servicing all process
-output, so Emacs server sockets and helper filters remain responsive.
-Secret-bearing child overrides are shadowed during every yield; hard
-containment therefore belongs to the dedicated-daemon bridge watchdog.
-Nonlocal exits recover every exact post-snapshot constructor child."
+Waits target this shell for return semantics while servicing ready process
+filters and ordinary timers.  Emacs server and MCP dispatch remain serialized;
+this wait does not make a second request concurrent.  Secret-bearing child
+overrides are shadowed during every yield; hard containment therefore belongs
+to the dedicated-daemon bridge watchdog.  Nonlocal exits recover every exact
+post-snapshot constructor child."
   (anvil-host--resource-state)
   ;; Public submission is fail-closed across cleanup snapshots.
   (when (anvil-host--cleanup-active-p)
@@ -763,17 +850,17 @@ Nonlocal exits recover every exact post-snapshot constructor child."
           (or anvil-host-child-shell-file-name shell-file-name))
          (child-switch
           (or anvil-host-child-shell-command-switch shell-command-switch))
-         stdout-chunks
-         stderr-chunks
+         (stdout-state (vector nil 0 nil))
+         (stderr-state (vector nil 0 nil))
          (stdout-filter
           (lambda (_process chunk)
             (unwind-protect
-                (push chunk stdout-chunks)
+                (anvil-host--capture-output-chunk stdout-state chunk)
               (anvil-host--scrub-code-conversion-work-buffer))))
          (stderr-filter
           (lambda (_process chunk)
             (unwind-protect
-                (push chunk stderr-chunks)
+                (anvil-host--capture-output-chunk stderr-state chunk)
               (anvil-host--scrub-code-conversion-work-buffer))))
          stderr-constructor-started-p
          stderr-constructor-before
@@ -889,8 +976,9 @@ Nonlocal exits recover every exact post-snapshot constructor child."
              (when (process-live-p proc)
                (signal (car error) (cdr error)))))
           ;; Shadow secret-bearing outer advice bindings during every yield.
-          ;; Accept foreign process output as well: Emacs server sockets and
-          ;; helper filters must remain responsive while the child is running.
+          ;; Accept already-ready foreign process output as well so ordinary
+          ;; timers and helper filters can progress.  Emacs server and MCP
+          ;; request dispatch are still serialized by their own event loops.
           (let ((anvil-host-child-process-environment nil)
                 (anvil-host-child-exec-path nil)
                 (anvil-host-child-shell-file-name nil)
@@ -899,9 +987,11 @@ Nonlocal exits recover every exact post-snapshot constructor child."
               (while (and (process-live-p proc)
                           (< (float-time) deadline))
                 (funcall anvil-host--accept-process-output-primitive proc 0.05 nil nil)
+                (anvil-host--check-output-capture stdout-state stderr-state)
                 (when (and (processp stderr-proc)
                            (process-live-p stderr-proc))
-                  (funcall anvil-host--accept-process-output-primitive stderr-proc 0 nil nil)))
+                  (funcall anvil-host--accept-process-output-primitive stderr-proc 0 nil nil)
+                  (anvil-host--check-output-capture stdout-state stderr-state)))
               (when (process-live-p proc)
                 (error "anvil-host: shell timeout after %ss: %s"
                        timeout command)))
@@ -913,14 +1003,17 @@ Nonlocal exits recover every exact post-snapshot constructor child."
                 (while (and (process-live-p stderr-proc)
                             (< (float-time) drain-deadline))
                   (funcall anvil-host--accept-process-output-primitive stderr-proc 0.02 nil nil)
-                  (funcall anvil-host--accept-process-output-primitive proc 0 nil nil))))
-            (funcall anvil-host--accept-process-output-primitive proc 0.01 nil nil))
+                  (anvil-host--check-output-capture stdout-state stderr-state)
+                  (funcall anvil-host--accept-process-output-primitive proc 0 nil nil)
+                  (anvil-host--check-output-capture stdout-state stderr-state))))
+            (funcall anvil-host--accept-process-output-primitive proc 0.01 nil nil)
+            (anvil-host--check-output-capture stdout-state stderr-state))
           (list
            (process-exit-status proc)
            (anvil-host--decode-output
-            (apply #'concat (nreverse stdout-chunks)) coding)
+            (anvil-host--captured-output stdout-state) coding)
            (anvil-host--decode-output
-            (apply #'concat (nreverse stderr-chunks)) coding)))
+            (anvil-host--captured-output stderr-state) coding)))
       ;; Always derive custody from the pre-call identity snapshot.  A
       ;; constructor may rewrite names, detach buffers, create suffix
       ;; collisions, or return a preexisting peer instead of its new child.
@@ -953,8 +1046,8 @@ Nonlocal exits recover every exact post-snapshot constructor child."
   "Run shell COMMAND on the host and return result as a plist.
 OPTS is a plist:
   :timeout    seconds (default 30)
-  :max-output bytes per stream (default 16384, nil = no limit)
-  :coding     coding-system for I/O (default: cp932-dos on Windows, utf-8 elsewhere)
+  :max-output bytes per stream (default 16384; nil disables presentation cap)
+  :coding     coding-system for I/O (cp932-dos on Windows, utf-8 elsewhere)
   :cwd        working directory
 
 Returns:
@@ -964,19 +1057,28 @@ Returns:
 Note: this is synchronous and fail-closed against overlapping or reentrant
 host submissions.  Its process waits keep ordinary timers responsive, but
 Emacs may dispatch a ready foreign process filter; use a dedicated daemon plus
-bridge watchdog for hard containment from arbitrary callback hangs."
+bridge watchdog for hard containment from arbitrary callback hangs.  Every
+stream also has a non-optional 16 MiB in-flight capture ceiling; crossing it
+retires the child transaction and signals an error.  Standalone/main Emacs
+does not add the dedicated backend's process-group guardian, so use that
+backend when forced cleanup of command descendants is required."
   (let* ((timeout    (or (plist-get opts :timeout) anvil-host--default-timeout))
          (max-output (if (plist-member opts :max-output)
                          (plist-get opts :max-output)
                        anvil-host--default-max-output))
+         (_ (unless (or (null max-output)
+                        (and (integerp max-output) (>= max-output 0)))
+              (error "anvil-host: :max-output must be nil or a nonnegative integer")))
          (coding     (or (plist-get opts :coding) (anvil-host--default-coding)))
          (cwd        (plist-get opts :cwd))
          (result     (anvil-host--run command coding cwd timeout))
          (exit       (nth 0 result))
          (stdout     (nth 1 result))
          (stderr     (nth 2 result))
-         (truncated  (or (and max-output (> (length stdout) max-output))
-                         (and max-output (> (length stderr) max-output)))))
+         (truncated  (or (and max-output
+                              (> (string-bytes stdout) max-output))
+                         (and max-output
+                              (> (string-bytes stderr) max-output)))))
     (list :exit exit
           :stdout (if max-output (anvil-host--truncate stdout max-output) stdout)
           :stderr (if max-output (anvil-host--truncate stderr max-output) stderr)
