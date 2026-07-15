@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Host shell capture now has a non-optional 16 MiB ceiling per stream,
   including when `anvil-shell` receives `:max-output nil`. Crossing the
   ceiling retires the child transaction and returns an error; redirect larger
-  output to a file.
+  output to a file. A separate 65,536-fragment ceiling also bounds list-cell
+  overhead from pathologically fragmented process-filter delivery.
 - Shell tee and per-line limits are strict byte budgets, including their
   truncation markers. Tee retrieval returns a bounded raw prefix rather than
   promising an unlimited copy.

@@ -2156,7 +2156,7 @@
 (ert-deftest anvil-host-reentrancy-capture-accepts-the-exact-byte-limit ()
   "The hard capture boundary is inclusive and becomes sticky after overflow."
   (let ((anvil-host--absolute-max-output-bytes 5)
-        (state (vector nil 0 nil)))
+        (state (vector nil 0 nil 0)))
     (anvil-host--capture-output-chunk state (unibyte-string ?a ?b ?c ?d ?e))
     (should (= 5 (aref state 1)))
     (should-not (aref state 2))
@@ -2164,6 +2164,24 @@
     (anvil-host--capture-output-chunk state (unibyte-string ?f))
     (should (= 5 (aref state 1)))
     (should (aref state 2))))
+
+(ert-deftest anvil-host-reentrancy-capture-bounds-fragment-overhead ()
+  "Tiny filter deliveries cannot create an unbounded retained list."
+  (let ((anvil-host--absolute-max-output-bytes 1024)
+        (anvil-host--absolute-max-output-chunks 4)
+        (state (vector nil 0 nil 0)))
+    (dotimes (_ 4)
+      (anvil-host--capture-output-chunk state (unibyte-string ?x)))
+    (should (= 4 (aref state 1)))
+    (should (= 4 (aref state 3)))
+    (should-not (aref state 2))
+    (anvil-host--capture-output-chunk state (unibyte-string ?x))
+    (should (eq 'fragments (aref state 2)))
+    (should (= 4 (length (aref state 0))))
+    (should-error
+     (anvil-host--check-output-capture state (vector nil 0 nil 0))
+     :type 'error)
+    (should (equal "xxxx" (anvil-host--captured-output state)))))
 
 (ert-deftest anvil-host-reentrancy-zz-global-state-remains-clean ()
   "Focused and full runs leave no hidden host custody state."

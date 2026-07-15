@@ -96,6 +96,11 @@ This bound applies even when `anvil-shell' receives `:max-output nil'.  A
 child that exceeds it is retired immediately instead of letting the root
 Emacs accumulate output until its presentation or tee layer runs.")
 
+(defconst anvil-host--absolute-max-output-chunks 65536
+  "Hard in-flight filter-fragment ceiling for each host-child stream.
+This independently bounds list-cell overhead when a process or test fragments
+otherwise-small output into unusually tiny filter deliveries.")
+
 (defconst anvil-host--stderr-drain-budget-sec 0.2
   "Seconds to drain the stderr pipe-proc after the main proc exits.
 Captures late stderr bytes that the kernel pipe still held when
@@ -757,29 +762,41 @@ a successful valid constructor may create unrelated helper processes."
 
 (defun anvil-host--capture-output-chunk (state chunk)
   "Append binary CHUNK to bounded capture STATE.
-STATE is a private vector of reversed chunks, retained bytes, and an overflow
-bit.  Once the absolute ceiling is crossed, retain only the prefix needed to
-reach it and discard every later byte until the transaction notices the bit."
+STATE is a private vector of reversed chunks, retained bytes, an overflow
+reason, and retained fragment count.  Once either absolute ceiling is crossed,
+retain at most the prefix needed to reach the byte limit and discard every
+later byte until the transaction notices the reason."
   (let* ((size (length chunk))
          (captured (aref state 1))
          (remaining (- anvil-host--absolute-max-output-bytes captured)))
-    (when (> size 0)
-      (if (<= size remaining)
-          (progn
-            (aset state 0 (cons chunk (aref state 0)))
-            (aset state 1 (+ captured size)))
+    (when (and (> size 0) (not (aref state 2)))
+      (cond
+       ((>= (aref state 3) anvil-host--absolute-max-output-chunks)
+        (aset state 2 'fragments))
+       ((<= size remaining)
+        (aset state 0 (cons chunk (aref state 0)))
+        (aset state 1 (+ captured size))
+        (aset state 3 (1+ (aref state 3))))
+       (t
         (when (> remaining 0)
           (aset state 0
                 (cons (substring chunk 0 remaining) (aref state 0)))
-          (aset state 1 anvil-host--absolute-max-output-bytes))
-        (aset state 2 t)))))
+          (aset state 1 anvil-host--absolute-max-output-bytes)
+          (aset state 3 (1+ (aref state 3))))
+        (aset state 2 'bytes))))))
 
 (defun anvil-host--check-output-capture (stdout-state stderr-state)
   "Fail when STDOUT-STATE or STDERR-STATE crossed the absolute ceiling."
   (cond
+   ((eq (aref stdout-state 2) 'fragments)
+    (error "anvil-host: stdout exceeded the %d-fragment capture limit"
+           anvil-host--absolute-max-output-chunks))
    ((aref stdout-state 2)
     (error "anvil-host: stdout exceeded the %d-byte capture limit"
            anvil-host--absolute-max-output-bytes))
+   ((eq (aref stderr-state 2) 'fragments)
+    (error "anvil-host: stderr exceeded the %d-fragment capture limit"
+           anvil-host--absolute-max-output-chunks))
    ((aref stderr-state 2)
     (error "anvil-host: stderr exceeded the %d-byte capture limit"
            anvil-host--absolute-max-output-bytes))))
@@ -850,8 +867,8 @@ post-snapshot constructor child."
           (or anvil-host-child-shell-file-name shell-file-name))
          (child-switch
           (or anvil-host-child-shell-command-switch shell-command-switch))
-         (stdout-state (vector nil 0 nil))
-         (stderr-state (vector nil 0 nil))
+         (stdout-state (vector nil 0 nil 0))
+         (stderr-state (vector nil 0 nil 0))
          (stdout-filter
           (lambda (_process chunk)
             (unwind-protect
