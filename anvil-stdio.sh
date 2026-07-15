@@ -141,6 +141,12 @@ anvil_mcp_exec_child() {
 	input:separate)
 		anvil_mcp_exec_program "$@" < <(printf '%s' "$input") 2>&8 8>&-
 		;;
+	request:merge)
+		anvil_mcp_exec_program "$@" < <(printf '%s' "$line") 2>&1 8>&-
+		;;
+	request:separate)
+		anvil_mcp_exec_program "$@" < <(printf '%s' "$line") 2>&8 8>&-
+		;;
 	descriptor:merge)
 		anvil_mcp_exec_program "$@" <&5 5<&- 2>&1 8>&-
 		;;
@@ -288,6 +294,10 @@ ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT=${ANVIL_EMACSCLIENT_KILL_AFTER_TIMEOUT:-1}
 ANVIL_MCP_REQUEST_PARSE_TIMEOUT=${ANVIL_MCP_REQUEST_PARSE_TIMEOUT:-10}
 ANVIL_MCP_FRAME_READ_TIMEOUT=${ANVIL_MCP_FRAME_READ_TIMEOUT:-10}
 readonly ANVIL_MCP_MAX_REQUEST_BYTES=16777216
+# Framed headers carry only transport metadata.  Bound their cumulative bytes
+# separately so a fast sender cannot turn the frame deadline into an
+# unbounded Bash allocation before Content-Length is validated.
+readonly ANVIL_MCP_MAX_HEADER_BYTES=65536
 # Linux limits each exec argument to 128 KiB even when ARG_MAX is much larger.
 # Keep inline request expressions comfortably below that boundary; larger
 # requests travel through one private bridge-owned staging directory instead.
@@ -590,16 +600,26 @@ fi
 # Prints the JSON body on STDOUT (no trailing newline).  Returns 1 on
 # EOF or malformed framing, 2 if no Content-Length header found.
 anvil_mcp_read_framed_message() {
+	local LC_ALL=C
 	local first_line="$1"
 	local frame_deadline="$2"
 	local header_line content_length="" frame_remaining
+	local header_bytes=${#first_line} header_remaining content_length_seen=0
 	ANVIL_MCP_FRAME_BODY=""
+	# Include the newline already consumed by the caller.
+	header_bytes=$((header_bytes + 1))
+	[ "$header_bytes" -le "$ANVIL_MCP_MAX_HEADER_BYTES" ] || return 3
 
 	# Process the already-consumed first line.
 	# Strip trailing CR (DOS line endings).
 	first_line="${first_line%$'\r'}"
-	if [[ "$first_line" =~ ^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
-		content_length="${BASH_REMATCH[1]}"
+	if [[ "$first_line" =~ ^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]: ]]; then
+		content_length_seen=1
+		if [[ "$first_line" =~ ^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+			content_length="${BASH_REMATCH[1]}"
+		else
+			return 3
+		fi
 	fi
 
 	# Read remaining header lines under the same cumulative frame deadline as
@@ -608,15 +628,29 @@ anvil_mcp_read_framed_message() {
 	while :; do
 		frame_remaining=$((frame_deadline - SECONDS))
 		[ "$frame_remaining" -gt 0 ] || return 1
-		if ! LC_ALL=C IFS= read -r -t "$frame_remaining" header_line; then
+		header_remaining=$((ANVIL_MCP_MAX_HEADER_BYTES - header_bytes))
+		[ "$header_remaining" -gt 0 ] || return 3
+		header_line=""
+		if ! LC_ALL=C IFS= read -r -t "$frame_remaining" \
+			-n "$header_remaining" header_line; then
 			return 1
 		fi
+		# Reaching the cap before a newline leaves an ambiguous remainder.  Fail
+		# the whole frame rather than interpreting that remainder as a request.
+		[ "${#header_line}" -lt "$header_remaining" ] || return 3
+		header_bytes=$((header_bytes + ${#header_line} + 1))
 		header_line="${header_line%$'\r'}"
 		if [ -z "$header_line" ]; then
 			break
 		fi
-		if [[ "$header_line" =~ ^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
-			content_length="${BASH_REMATCH[1]}"
+		if [[ "$header_line" =~ ^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]: ]]; then
+			[ "$content_length_seen" -eq 0 ] || return 3
+			content_length_seen=1
+			if [[ "$header_line" =~ ^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+				content_length="${BASH_REMATCH[1]}"
+			else
+				return 3
+			fi
 		fi
 	done
 
@@ -724,13 +758,13 @@ anvil_mcp_emit_wire_response() {
 # after the readiness probe succeeds, avoiding both exec argument limits and
 # unused files when Emacs is unavailable.
 anvil_mcp_request_metadata() {
-	local request="$1"
-	if [ "${#request}" -gt "$ANVIL_MCP_MAX_REQUEST_BYTES" ]; then
+	local LC_ALL=C
+	if [ "${#line}" -gt "$ANVIL_MCP_MAX_REQUEST_BYTES" ]; then
 		printf 'parse-error|0|none||0|null'
 		return 0
 	fi
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
-		merge input "$request" "$ANVIL_MCP_PYTHON" -I -S -c '
+		merge request "" "$ANVIL_MCP_PYTHON" -I -S -c '
 import base64
 import json
 import math
@@ -807,9 +841,9 @@ else:
 # directory and file without following links, verifies ownership/modes, writes
 # the exact request bytes, and returns only the base64-encoded absolute path.
 anvil_mcp_stage_request() {
-	local request="$1" basename="$2"
+	local basename="$1"
 	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
-		merge input "$request" "$ANVIL_MCP_PYTHON" -I -S -c '
+		merge request "" "$ANVIL_MCP_PYTHON" -I -S -c '
 import base64
 import os
 import signal
@@ -824,6 +858,10 @@ maximum = int(sys.argv[3])
 raw = sys.stdin.buffer.read(maximum + 1)
 if len(raw) > maximum:
     raise SystemExit(65)
+# The inherited umask may be more restrictive than the exact private modes
+# required below.  This helper is a short-lived child, so normalize it before
+# creating either object instead of leaving an uncleanable mode-000 artifact.
+os.umask(0o077)
 if not basename.isascii() or not basename.startswith("request."):
     raise SystemExit(64)
 if "/" in basename or (os.altsep and os.altsep in basename):
@@ -892,6 +930,78 @@ except BaseException:
 	return "$ANVIL_MCP_RUN_STATUS"
 }
 
+# Remove only bridge-owned staging artifacts.  A staging helper that reaches
+# SIGKILL cannot run its Python exception cleanup, so the parent retries the
+# cleanup under its own independent deadline before returning a pre-dispatch
+# error.  The EXIT trap covers a bridge that terminates after an ambiguous
+# dispatch.  Unexpected entries fail closed rather than broadening deletion.
+anvil_mcp_cleanup_request_directory() {
+	if [ ! -e "$ANVIL_MCP_REQUEST_DIRECTORY" ] \
+		&& [ ! -L "$ANVIL_MCP_REQUEST_DIRECTORY" ]; then
+		return 0
+	fi
+	anvil_mcp_run_bounded "$ANVIL_MCP_REQUEST_PARSE_TIMEOUT" \
+		merge null "" "$ANVIL_MCP_PYTHON" -I -S -c '
+import os
+import stat
+import sys
+
+directory = os.path.abspath(sys.argv[1])
+try:
+    before = os.lstat(directory)
+except FileNotFoundError:
+    raise SystemExit(0)
+if (
+    not stat.S_ISDIR(before.st_mode)
+    or before.st_uid != os.geteuid()
+    or stat.S_IMODE(before.st_mode) != 0o700
+):
+    raise SystemExit(73)
+
+flags = os.O_RDONLY
+if hasattr(os, "O_DIRECTORY"):
+    flags |= os.O_DIRECTORY
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = os.open(directory, flags)
+try:
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or stat.S_IMODE(opened.st_mode) != 0o700
+        or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise SystemExit(73)
+    names = os.listdir(descriptor)
+    for name in names:
+        if (
+            not name.startswith("request.")
+            or not name.endswith(".json")
+        ):
+            raise SystemExit(73)
+        middle = name[len("request.") : -len(".json")]
+        if not middle.isascii() or not middle.isdecimal():
+            raise SystemExit(73)
+        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise SystemExit(73)
+    for name in names:
+        os.unlink(name, dir_fd=descriptor)
+finally:
+    os.close(descriptor)
+os.rmdir(directory)
+' "$ANVIL_MCP_REQUEST_DIRECTORY"
+	return "$ANVIL_MCP_RUN_STATUS"
+}
+
+trap 'anvil_mcp_cleanup_request_directory >/dev/null 2>&1 || :' EXIT
+
 # Emit a correlated at-most-once error.  Notifications remain silent;
 # malformed input receives a protocol error with id null.
 anvil_mcp_synthetic_error() {
@@ -951,8 +1061,19 @@ anvil_mcp_synthetic_error() {
 # but one absolute request deadline starts as soon as the first byte arrives.
 mcp_debug_log "READY" "stdio request loop"
 while :; do
+	# `read -n' counts bytes under C.  Keep every corresponding limit check in
+	# that same locale, then restore the caller locale before dispatching tools.
+	_anvil_lc_all_was_set=${LC_ALL+x}
+	_anvil_saved_lc_all=${LC_ALL-}
+	LC_ALL=C
 	_anvil_first_byte=""
-	if ! LC_ALL=C IFS= read -r -d '' -n 1 _anvil_first_byte; then
+	if ! IFS= read -r -d '' -n 1 _anvil_first_byte; then
+		if [ -n "$_anvil_lc_all_was_set" ]; then
+			LC_ALL=$_anvil_saved_lc_all
+		else
+			unset LC_ALL
+		fi
+		unset _anvil_lc_all_was_set _anvil_saved_lc_all
 		break
 	fi
 	_anvil_frame_deadline=$((SECONDS + ANVIL_MCP_FRAME_READ_TIMEOUT))
@@ -964,9 +1085,18 @@ while :; do
 	else
 		_anvil_frame_remaining=$((_anvil_frame_deadline - SECONDS))
 		[ "$_anvil_frame_remaining" -gt 0 ] || exit 65
+		_anvil_first_line_limit=$ANVIL_MCP_MAX_REQUEST_BYTES
+		case "$_anvil_first_byte" in
+		[Cc]) _anvil_first_line_limit=$ANVIL_MCP_MAX_HEADER_BYTES ;;
+		esac
 		_anvil_line_tail=""
-		if ! LC_ALL=C IFS= read -r -t "$_anvil_frame_remaining" _anvil_line_tail; then
+		if ! IFS= read -r -t "$_anvil_frame_remaining" \
+			-n "$_anvil_first_line_limit" _anvil_line_tail; then
 			mcp_debug_log "FRAMING-ERROR" "phase=first-line"
+			exit 65
+		fi
+		if [ "${#_anvil_line_tail}" -ge "$_anvil_first_line_limit" ]; then
+			mcp_debug_log "FRAMING-ERROR" "phase=first-line size=too-large"
 			exit 65
 		fi
 		line="${_anvil_first_byte}${_anvil_line_tail}"
@@ -974,16 +1104,20 @@ while :; do
 
 	# T71: detect framing.  An MCP framed request begins with
 	# `Content-Length:' (case-insensitive); legacy line-delimited
-	# requests begin with `{'.
-	# Strip CR for cross-platform safety.
-	_anvil_first_line="${line%$'\r'}"
+	# requests begin with `{'.  Apply CR pattern removal only to the bounded
+	# header candidate: Bash pattern matching over a multi-megabyte legacy JSON
+	# line is pathologically slow on macOS and used to peg the bridge CPU.
+	_anvil_first_line="$line"
 	_anvil_framed=0
+	case "$_anvil_first_byte" in
+	[Cc]) _anvil_first_line="${line%$'\r'}" ;;
+	esac
 	if [[ "$_anvil_first_line" =~ ^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]: ]]; then
 		_anvil_framed=1
 		mcp_debug_log "FRAMING" "Content-Length detected"
 		# Re-read full framed message; reuse the already-consumed line.
 		if anvil_mcp_read_framed_message \
-			"$_anvil_first_line" "$_anvil_frame_deadline"; then
+			"$line" "$_anvil_frame_deadline"; then
 			line=$ANVIL_MCP_FRAME_BODY
 		else
 			_anvil_frame_rc=$?
@@ -994,6 +1128,12 @@ while :; do
 			exit 65
 		fi
 	fi
+	if [ -n "$_anvil_lc_all_was_set" ]; then
+		LC_ALL=$_anvil_saved_lc_all
+	else
+		unset LC_ALL
+	fi
+	unset _anvil_lc_all_was_set _anvil_saved_lc_all
 
 	# Log the incoming request
 	mcp_debug_log "REQUEST" "bytes=${#line} head=${line:0:160}"
@@ -1001,7 +1141,7 @@ while :; do
 	# Parse top-level metadata before touching Emacs.  This gives error paths a
 	# correct correlation id and lets initialize use its shorter startup cap.
 	set +e
-	_anvil_metadata=$(anvil_mcp_request_metadata "$line")
+	_anvil_metadata=$(anvil_mcp_request_metadata)
 	_anvil_metadata_rc=$?
 	set -e
 	if [ "$_anvil_metadata_rc" -ne 0 ]; then
@@ -1119,13 +1259,16 @@ while :; do
 		_anvil_request_basename="request.${ANVIL_MCP_REQUEST_SEQUENCE}.json"
 		set +e
 		_anvil_request_payload=$(anvil_mcp_stage_request \
-			"$line" "$_anvil_request_basename")
+			"$_anvil_request_basename")
 		_anvil_stage_rc=$?
 		set -e
 		case "$_anvil_request_payload" in
 		""|*[!A-Za-z0-9+/=]*) _anvil_stage_rc=70 ;;
 		esac
 		if [ "$_anvil_stage_rc" -ne 0 ]; then
+			if ! anvil_mcp_cleanup_request_directory >/dev/null 2>&1; then
+				mcp_debug_log "STAGE-CLEANUP" "failed before dispatch"
+			fi
 			anvil_mcp_capture_finish
 			anvil_mcp_synthetic_error \
 				"$_anvil_request_kind" "$_anvil_request_id" \

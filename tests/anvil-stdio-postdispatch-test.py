@@ -854,6 +854,24 @@ def synthetic_dispatch_error(request_id: object, rc: int) -> dict[str, object]:
     }
 
 
+def synthetic_stage_error(request_id: object, rc: int) -> dict[str, object]:
+    """Return the pre-dispatch error emitted when request staging fails."""
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": -32603,
+            "message": "Bridge synthetic error: large request staging failed before dispatch",
+            "data": {
+                "phase": "stage",
+                "dispatched": False,
+                "replayed": False,
+                "emacsclientRc": rc,
+            },
+        },
+    }
+
+
 def synthetic_parse_runner_error(rc: int) -> dict[str, object]:
     """Return the expected bounded pre-dispatch runner error."""
     return {
@@ -1526,6 +1544,188 @@ def run_idle_then_partial_first_line(
                 terminate_bridge(process)
 
 
+def run_input_size_limits(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """Reject oversized lines and ambiguous framing before allocation grows."""
+    with tempfile.TemporaryDirectory(prefix="anvil-stdio-input-limits-") as raw_root:
+        root = Path(raw_root)
+        source = stdio.read_text(encoding="utf-8")
+        replacements = {
+            "readonly ANVIL_MCP_MAX_REQUEST_BYTES=16777216": (
+                "readonly ANVIL_MCP_MAX_REQUEST_BYTES=1024"
+            ),
+            "readonly ANVIL_MCP_MAX_HEADER_BYTES=65536": (
+                "readonly ANVIL_MCP_MAX_HEADER_BYTES=128"
+            ),
+        }
+        for original, replacement in replacements.items():
+            if source.count(original) != 1:
+                raise AssertionError(f"input limit marker changed: {original}")
+            source = source.replace(original, replacement)
+        limited_stdio = root / "anvil-stdio-input-limits.sh"
+        limited_stdio.write_text(source, encoding="utf-8")
+        limited_stdio.chmod(0o755)
+
+        cases = {
+            "legacy-line": b"{" + (b"x" * 1024) + b"\n",
+            "legacy-multibyte-line": b"{" + ("é" * 512).encode() + b"\n",
+            "header-line": (
+                b"Content-Length: 2\r\nX-Long: " + (b"x" * 128) + b"\r\n\r\n{}"
+            ),
+            "header-multibyte-line": (
+                b"Content-Length: 2\r\nX-Long: " + ("é" * 64).encode() + b"\r\n\r\n{}"
+            ),
+            "duplicate-length": (b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}"),
+            "malformed-then-valid-length": (
+                b"Content-Length: nope\r\nContent-Length: 2\r\n\r\n{}"
+            ),
+        }
+        for label, payload in cases.items():
+            case_root = root / label
+            case_root.mkdir()
+            environment, paths = build_fixture(
+                case_root,
+                real_helpers,
+                [percent_wire(json_bytes({"unused": True}))],
+                bash,
+            )
+            process = start_bridge(
+                bash,
+                limited_stdio,
+                environment,
+                paths["bridge_stderr"],
+                f"--socket=/tmp/anvil-input-limit-{label}",
+                "--server-id=test",
+            )
+            try:
+                wait_for_bridge_ready(paths["debug_log"], process)
+                if process.stdin is None:
+                    raise AssertionError("bridge stdin is unavailable")
+                process.stdin.write(payload)
+                process.stdin.flush()
+                wait_for_bridge_reap(
+                    process,
+                    timeout=FRAME_EXIT_TIMEOUT_SECONDS,
+                )
+                if process.returncode == 0:
+                    raise AssertionError(f"{label} exited successfully")
+                if read_count(paths["dispatch_count"]) != 0:
+                    raise AssertionError(f"{label} reached stateful Emacs")
+                if not wait_until(lambda: not process_group_alive(process.pid), 2):
+                    raise AssertionError(f"{label} bridge group survived exit")
+            finally:
+                terminate_bridge(process)
+
+        legacy_params = {"raw": ""}
+        legacy_document = {
+            "jsonrpc": "2.0",
+            "id": "legacy-boundary",
+            "method": "test",
+            "params": legacy_params,
+        }
+        base_size = len(json_bytes(legacy_document))
+        legacy_params["raw"] = "x" * (1024 - base_size)
+        legacy_body = json_bytes(legacy_document)
+        if len(legacy_body) != 1024:
+            raise AssertionError("legacy request boundary fixture is not exact")
+
+        framed_document = {
+            "jsonrpc": "2.0",
+            "id": "header-boundary",
+            "method": "test",
+        }
+        framed_body = json_bytes(framed_document)
+        first_header = f"Content-Length: {len(framed_body)}\r\n".encode("ascii")
+        fixed_header = first_header + b"X-Pad: \r\n\r\n"
+        framed_header = (
+            first_header + b"X-Pad: " + (b"x" * (128 - len(fixed_header))) + b"\r\n\r\n"
+        )
+        if len(framed_header) != 128:
+            raise AssertionError("framed header boundary fixture is not exact")
+
+        boundary_root = root / "accepted-boundaries"
+        boundary_root.mkdir()
+        first_response = {
+            "jsonrpc": "2.0",
+            "id": "legacy-boundary",
+            "result": "legacy-boundary-ok",
+        }
+        second_response = {
+            "jsonrpc": "2.0",
+            "id": "header-boundary",
+            "result": "header-boundary-ok",
+        }
+        environment, paths = build_fixture(
+            boundary_root,
+            real_helpers,
+            [
+                percent_wire(json_bytes(first_response)),
+                percent_wire(json_bytes(second_response)),
+            ],
+            bash,
+        )
+        process = start_bridge(
+            bash,
+            limited_stdio,
+            environment,
+            paths["bridge_stderr"],
+            "--socket=/tmp/anvil-input-limit-boundaries",
+            "--server-id=test",
+        )
+        reader = BinaryReader(
+            process,
+            paths["debug_log"],
+            paths["bridge_stderr"],
+            paths["helper_marker"],
+            paths["dispatch_count"],
+        )
+        clean = False
+        try:
+            wait_for_bridge_ready(paths["debug_log"], process)
+            if process.stdin is None:
+                raise AssertionError("bridge stdin is unavailable")
+            process.stdin.write(legacy_body + b"\n")
+            process.stdin.flush()
+            wait_for_dispatch_complete(
+                paths["dispatch_complete"],
+                process,
+                paths["dispatch_ack_fifo"],
+                1,
+            )
+            read_reply(reader, first_response, framed=False)
+            paths["dispatch_complete"].unlink()
+
+            process.stdin.write(framed_header + framed_body)
+            process.stdin.flush()
+            wait_for_dispatch_complete(
+                paths["dispatch_complete"],
+                process,
+                paths["dispatch_ack_fifo"],
+                2,
+            )
+            read_reply(reader, second_response, framed=True)
+            paths["dispatch_complete"].unlink()
+            if read_count(paths["dispatch_count"]) != 2:
+                raise AssertionError("accepted boundary request was lost or replayed")
+
+            process.stdin.close()
+            process.wait(timeout=5)
+            if process.returncode != 0:
+                raise AssertionError(reader.diagnostics())
+            if not wait_until(lambda: not process_group_alive(process.pid), 2):
+                raise AssertionError("boundary bridge process group survived exit")
+            clean = True
+        finally:
+            reader.close()
+            if not clean:
+                terminate_bridge(process)
+            elif process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
+
+
 def run_cumulative_frame_budget(
     stdio: Path,
     bash: str,
@@ -1998,25 +2198,40 @@ def run_large_request_metadata(
     """Prove large and pipelined requests preserve framing and the same pipe."""
     with tempfile.TemporaryDirectory(prefix="anvil-stdio-large-request-") as raw_root:
         root = Path(raw_root)
-        first = synthetic_dispatch_error("large|pipe", 70)
-        second = {
+        source = stdio.read_text(encoding="utf-8")
+        needle = '\tlocal basename="$1"\n'
+        if source.count(needle) != 1:
+            raise AssertionError("staging function marker changed")
+        restrictive_stdio = root / "anvil-stdio-restrictive-umask.sh"
+        restrictive_stdio.write_text(
+            source.replace(needle, f"{needle}\tumask 0777\n"),
+            encoding="utf-8",
+        )
+        restrictive_stdio.chmod(0o755)
+        first = synthetic_dispatch_error("large|legacy", 70)
+        second = synthetic_dispatch_error("large|framed", 70)
+        third = {
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 3,
             "result": "recovery-ok",
         }
-        large_document = {
+        legacy_document = {
             "jsonrpc": "2.0",
-            "id": "large|pipe",
+            "id": "large|legacy",
             "method": "test",
-            "params": {"raw": "雪" + ("x" * (512 * 1024))},
+            "params": {"raw": "雪" + ("x" * (2 * 1024 * 1024))},
         }
-        large_bytes = json_bytes(large_document)
+        framed_document = dict(legacy_document)
+        framed_document["id"] = "large|framed"
+        legacy_bytes = json_bytes(legacy_document)
+        framed_bytes = json_bytes(framed_document)
         environment, paths = build_fixture(
             root,
             real_helpers,
             [
                 "%7b%00%7d",
-                percent_wire(json_bytes(second)),
+                "%7b%00%7d",
+                percent_wire(json_bytes(third)),
             ],
             bash,
         )
@@ -2026,7 +2241,7 @@ def run_large_request_metadata(
         environment["TMPDIR"] = str(symlink_temp)
         process = start_bridge(
             bash,
-            stdio,
+            restrictive_stdio,
             environment,
             paths["bridge_stderr"],
             "--socket=/tmp/anvil-large-request-test",
@@ -2050,16 +2265,13 @@ def run_large_request_metadata(
                 os.fstat(process.stdout.fileno()).st_ino,
             )
             try:
-                send(process, large_document, framed=True)
-                send(
-                    process,
-                    {"jsonrpc": "2.0", "id": 2, "method": "test"},
-                    framed=True,
-                )
+                send(process, legacy_document, framed=False)
             except BrokenPipeError as error:
                 raise AssertionError(reader.diagnostics()) from error
 
-            def assert_staged_request() -> None:
+            staged_paths: list[Path] = []
+
+            def assert_staged_request(expected: bytes) -> Path:
                 directories = list(paths["temp"].glob("anvil-mcp.*"))
                 if len(directories) != 1:
                     raise AssertionError(
@@ -2076,30 +2288,62 @@ def run_large_request_metadata(
                 staged = requests[0]
                 if stat.S_IMODE(staged.stat().st_mode) != 0o600:
                     raise AssertionError("staged request is not mode 0600")
-                if staged.read_bytes() != large_bytes:
+                if staged.read_bytes() != expected:
                     raise AssertionError("staged request bytes differ")
+                return staged
 
             wait_for_dispatch_complete(
                 paths["dispatch_complete"],
                 process,
                 paths["dispatch_ack_fifo"],
                 1,
-                assert_staged_request,
+                lambda: staged_paths.append(assert_staged_request(legacy_bytes)),
             )
-            read_reply(reader, first, framed=True)
+            read_reply(reader, first, framed=False)
             paths["dispatch_complete"].unlink()
             assert_same_bridge(process, original_pid, pipe_ids)
+            # The fake emacsclient does not evaluate the production
+            # unwind-protect that removes a consumed staged request.  Mirror
+            # that successful-dispatch cleanup before staging request two.
+            first_staged = staged_paths.pop()
+            first_staged.unlink()
+            first_staged.parent.rmdir()
+
+            try:
+                send(process, framed_document, framed=True)
+            except BrokenPipeError as error:
+                raise AssertionError(reader.diagnostics()) from error
 
             wait_for_dispatch_complete(
                 paths["dispatch_complete"],
                 process,
                 paths["dispatch_ack_fifo"],
                 2,
+                lambda: staged_paths.append(assert_staged_request(framed_bytes)),
             )
             read_reply(reader, second, framed=True)
             paths["dispatch_complete"].unlink()
             assert_same_bridge(process, original_pid, pipe_ids)
-            if read_count(paths["dispatch_count"]) != 2:
+
+            try:
+                send(
+                    process,
+                    {"jsonrpc": "2.0", "id": 3, "method": "test"},
+                    framed=True,
+                )
+            except BrokenPipeError as error:
+                raise AssertionError(reader.diagnostics()) from error
+
+            wait_for_dispatch_complete(
+                paths["dispatch_complete"],
+                process,
+                paths["dispatch_ack_fifo"],
+                3,
+            )
+            read_reply(reader, third, framed=True)
+            paths["dispatch_complete"].unlink()
+            assert_same_bridge(process, original_pid, pipe_ids)
+            if read_count(paths["dispatch_count"]) != 3:
                 raise AssertionError("large request was replayed")
 
             process.stdin.close()
@@ -2108,6 +2352,8 @@ def run_large_request_metadata(
                 raise AssertionError(reader.diagnostics())
             if not wait_until(lambda: not process_group_alive(process.pid), 2):
                 raise AssertionError("large-request process group survived exit")
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("bridge exit left request staging paths")
             clean = True
         finally:
             reader.close()
@@ -2117,6 +2363,118 @@ def run_large_request_metadata(
                 for stream in (process.stdout,):
                     if stream is not None and not stream.closed:
                         stream.close()
+
+
+def run_stage_kill_cleanup(
+    stdio: Path,
+    bash: str,
+    real_helpers: dict[str, str],
+) -> None:
+    """Require parent cleanup after SIGKILL prevents helper unwinding."""
+    with tempfile.TemporaryDirectory(prefix="anvil-stdio-stage-kill-") as raw_root:
+        root = Path(raw_root)
+        source = stdio.read_text(encoding="utf-8")
+        needle = '    print(base64.b64encode(os.fsencode(path)).decode("ascii"))'
+        if source.count(needle) != 1:
+            raise AssertionError("staging success marker changed")
+        killed_source = source.replace(
+            needle,
+            "    os.kill(os.getpid(), signal.SIGKILL)",
+        )
+        killed_stdio = root / "anvil-stdio-stage-kill.sh"
+        killed_stdio.write_text(killed_source, encoding="utf-8")
+        killed_stdio.chmod(0o755)
+
+        recovery = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": "stage-recovery-ok",
+        }
+        large_document = {
+            "jsonrpc": "2.0",
+            "id": "stage-kill",
+            "method": "test",
+            "params": {"raw": "x" * (512 * 1024)},
+        }
+        environment, paths = build_fixture(
+            root,
+            real_helpers,
+            [percent_wire(json_bytes(recovery))],
+            bash,
+        )
+        process = start_bridge(
+            bash,
+            killed_stdio,
+            environment,
+            paths["bridge_stderr"],
+            "--socket=/tmp/anvil-stage-kill-test",
+            "--server-id=test",
+        )
+        reader = BinaryReader(
+            process,
+            paths["debug_log"],
+            paths["bridge_stderr"],
+            paths["helper_marker"],
+            paths["dispatch_count"],
+        )
+        clean = False
+        try:
+            wait_for_bridge_ready(paths["debug_log"], process)
+            original_pid = process.pid
+            if process.stdin is None or process.stdout is None:
+                raise AssertionError("bridge pipes are unavailable")
+            pipe_ids = (
+                os.fstat(process.stdin.fileno()).st_ino,
+                os.fstat(process.stdout.fileno()).st_ino,
+            )
+            send(process, large_document, framed=True)
+            read_reply(
+                reader,
+                # A helper killed before the bounded runner's sentinel is an
+                # intentionally ambiguous runner failure, reported as the
+                # bridge's stable software-error status rather than exposing
+                # shell-specific signal arithmetic (128 + SIGKILL).
+                synthetic_stage_error("stage-kill", 70),
+                framed=True,
+            )
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("killed staging helper left private paths")
+            if read_count(paths["dispatch_count"]) != 0:
+                raise AssertionError("failed staging reached dispatch")
+            assert_same_bridge(process, original_pid, pipe_ids)
+
+            send(
+                process,
+                {"jsonrpc": "2.0", "id": 2, "method": "test"},
+                framed=True,
+            )
+            wait_for_dispatch_complete(
+                paths["dispatch_complete"],
+                process,
+                paths["dispatch_ack_fifo"],
+                1,
+            )
+            read_reply(reader, recovery, framed=True)
+            paths["dispatch_complete"].unlink()
+            assert_same_bridge(process, original_pid, pipe_ids)
+            if read_count(paths["dispatch_count"]) != 1:
+                raise AssertionError("stage failure replayed or lost recovery")
+
+            process.stdin.close()
+            process.wait(timeout=5)
+            if process.returncode != 0:
+                raise AssertionError(reader.diagnostics())
+            if not wait_until(lambda: not process_group_alive(process.pid), 2):
+                raise AssertionError("stage-kill process group survived exit")
+            if list(paths["temp"].glob("anvil-mcp.*")):
+                raise AssertionError("stage-kill bridge exit left private paths")
+            clean = True
+        finally:
+            reader.close()
+            if not clean:
+                terminate_bridge(process)
+            elif process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
 
 
 def main() -> int:
@@ -2185,6 +2543,7 @@ def main() -> int:
     )
     run_default_parse_budget(stdio, bash, real_helpers)
     run_idle_then_partial_first_line(stdio, bash, real_helpers)
+    run_input_size_limits(stdio, bash, real_helpers)
     run_stalled_frame_header(stdio, bash, real_helpers)
     run_truncated_frame(stdio, bash, real_helpers)
     run_cumulative_frame_budget(stdio, bash, real_helpers)
@@ -2196,6 +2555,7 @@ def main() -> int:
             parent_guard,
             parent_guard_python,
         )
+    run_stage_kill_cleanup(stdio, bash, real_helpers)
     run_large_request_metadata(stdio, bash, real_helpers)
     run_positive(stdio, bash, real_helpers)
     print(f"stdio-postdispatch-ok bash={bash}")

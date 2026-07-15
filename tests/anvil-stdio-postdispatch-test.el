@@ -94,7 +94,18 @@
          (string-match-p
           (regexp-quote "readonly ANVIL_MCP_INLINE_REQUEST_BYTES=16384")
           source))
+        (should
+         (string-match-p
+          (regexp-quote "readonly ANVIL_MCP_MAX_HEADER_BYTES=65536")
+          source))
         (should (string-match-p "anvil_mcp_stage_request()" source))
+        (should
+         (string-match-p "anvil_mcp_cleanup_request_directory()" source))
+        (should
+         (string-match-p
+          (regexp-quote
+           "trap 'anvil_mcp_cleanup_request_directory >/dev/null 2>&1 || :' EXIT")
+          source))
         (should-not (string-match-p "ANVIL_MCP_HEAD" source))
         (should
          (string-match-p
