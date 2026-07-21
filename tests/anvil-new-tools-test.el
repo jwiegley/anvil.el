@@ -11,6 +11,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
 (require 'anvil-elisp)
 (require 'anvil-file)
 (require 'anvil-sqlite)
@@ -486,6 +487,116 @@ subprocess's direct DB open path."
             (should (= 3 (plist-get res :count)))
             (should (equal "h1" (plist-get (nth 0 items) :kind)))
             (should (equal "h3" (plist-get (nth 2 items) :kind)))))
+      (ignore-errors (delete-file tmp)))))
+
+(ert-deftest anvil-tools-test-outline-yaml-infers-yml-extension ()
+  "A .yml file routes to the YAML outline implementation."
+  (let ((tmp (make-temp-file "anvil-outline-" nil ".yml")))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write tmp "root:\n  child: value\n")
+          (cl-letf (((symbol-function 'anvil-file--outline-yaml)
+                     (lambda ()
+                       '((:kind "key1" :name "root" :line 1)))))
+            (let ((res (anvil-new-tools-test--read-plist
+                        (anvil-file--tool-outline tmp nil))))
+              (should (equal "yaml" (plist-get res :format)))
+              (should (= 1 (plist-get res :count))))))
+      (ignore-errors (delete-file tmp)))))
+
+(ert-deftest anvil-tools-test-outline-yaml ()
+  "YAML outline lists structural keys and omits nested scalar leaves."
+  (skip-unless
+   (and (require 'treesit nil t)
+        (treesit-ready-p 'yaml t)))
+  (let ((tmp (make-temp-file "anvil-outline-" nil ".yaml")))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write
+           tmp
+           "version: 1
+providers:
+  example:
+    display_name: Example
+    models:
+      one:
+        max_output_tokens: 42
+    tags: [fast, local]
+message: |
+  fake:
+")
+          (let* ((res (anvil-new-tools-test--read-plist
+                       (anvil-file--tool-outline tmp nil)))
+                 (items (plist-get res :items)))
+            (should (equal "yaml" (plist-get res :format)))
+            (should
+             (equal '("version" "providers" "example" "models"
+                      "one" "tags" "message")
+                    (mapcar (lambda (item) (plist-get item :name)) items)))
+            (should
+             (equal '("key1" "key1" "key2" "key3"
+                      "key4" "key3" "key1")
+                    (mapcar (lambda (item) (plist-get item :kind)) items)))
+            (should
+             (equal '(1 2 3 5 6 8 9)
+                    (mapcar (lambda (item) (plist-get item :line)) items)))
+            (should-not
+             (seq-find (lambda (item)
+                         (equal "display_name" (plist-get item :name)))
+                       items))
+            (should-not
+             (seq-find (lambda (item)
+                         (equal "fake" (plist-get item :name)))
+                       items))))
+      (ignore-errors (delete-file tmp)))))
+
+(ert-deftest anvil-tools-test-outline-yaml-requires-grammar ()
+  "YAML outline reports a clear error when its grammar is unavailable."
+  (cl-letf (((symbol-function 'treesit-ready-p) (lambda (&rest _) nil)))
+    (with-temp-buffer
+      (insert "root: value\n")
+      (should-error (anvil-file--outline-yaml)
+                    :type 'error))))
+
+(ert-deftest anvil-tools-test-outline-yaml-root-sequence-stays-compact ()
+  "Root sequences do not promote every scalar item field to a top-level key."
+  (skip-unless
+   (and (require 'treesit nil t)
+        (treesit-ready-p 'yaml t)))
+  (let ((tmp (make-temp-file "anvil-outline-" nil ".yaml")))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write
+           tmp
+           "- name: first
+  config:
+    options: [a, b]
+- name: second
+  config: {}
+")
+          (let* ((res (anvil-new-tools-test--read-plist
+                       (anvil-file--tool-outline tmp nil)))
+                 (items (plist-get res :items)))
+            (should (= 3 (plist-get res :count)))
+            (should (equal '("config" "options" "config")
+                           (mapcar (lambda (item) (plist-get item :name))
+                                   items)))
+            (should (equal '("key2" "key3" "key2")
+                           (mapcar (lambda (item) (plist-get item :kind))
+                                   items)))))
+      (ignore-errors (delete-file tmp)))))
+
+(ert-deftest anvil-tools-test-outline-yaml-rejects-malformed-input ()
+  "YAML outline rejects syntax errors instead of returning a partial tree."
+  (skip-unless
+   (and (require 'treesit nil t)
+        (treesit-ready-p 'yaml t)))
+  (let ((tmp (make-temp-file "anvil-outline-" nil ".yaml")))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write tmp "root: [unterminated\n")
+          (should-error (anvil-file--tool-outline tmp nil)
+                        :type 'anvil-server-tool-error))
       (ignore-errors (delete-file tmp)))))
 
 (ert-deftest anvil-tools-test-outline-unknown-extension-errors ()

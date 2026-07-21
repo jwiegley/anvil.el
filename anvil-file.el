@@ -48,6 +48,18 @@
 (defvar org-after-todo-state-change-hook)
 (defvar org-log-done)
 (defvar org-log-repeat)
+(declare-function treesit-node-check "treesit" (node property))
+(declare-function treesit-node-child "treesit" (node n &optional named))
+(declare-function treesit-node-child-by-field-name "treesit" (node field-name))
+(declare-function treesit-node-child-count "treesit" (node &optional named))
+(declare-function treesit-node-parent "treesit" (node))
+(declare-function treesit-node-start "treesit" (node))
+(declare-function treesit-node-text "treesit" (node &optional no-property))
+(declare-function treesit-node-type "treesit" (node))
+(declare-function treesit-parser-create "treesit" (language &optional buffer no-reuse))
+(declare-function treesit-parser-delete "treesit" (parser))
+(declare-function treesit-parser-root-node "treesit" (parser))
+(declare-function treesit-ready-p "treesit" (language &optional quiet))
 
 ;;;; --- internal -----------------------------------------------------------
 
@@ -2452,14 +2464,88 @@ MCP Parameters:
             items))
     (nreverse items)))
 
+(defun anvil-file--yaml-pair-p (node)
+  "Return non-nil when NODE is a YAML mapping pair."
+  (member (treesit-node-type node) '("block_mapping_pair" "flow_pair")))
+
+(defconst anvil-file--yaml-collection-node-types
+  '("block_mapping" "flow_mapping" "block_sequence" "flow_sequence")
+  "Tree-sitter node types that add one level of YAML structure.")
+
+(defun anvil-file--yaml-collection-p (node)
+  "Return non-nil when YAML NODE wraps a mapping or sequence value."
+  (when node
+    (if (member (treesit-node-type node)
+                anvil-file--yaml-collection-node-types)
+        t
+      (let ((index 0)
+            (count (treesit-node-child-count node t))
+            found)
+        (while (and (< index count) (not found))
+          (setq found
+                (anvil-file--yaml-collection-p
+                 (treesit-node-child node index t)))
+          (setq index (1+ index)))
+        found))))
+
+(defun anvil-file--yaml-pair-depth (node)
+  "Return the collection nesting depth of YAML mapping-pair NODE."
+  (let ((depth 0)
+        (parent (treesit-node-parent node)))
+    (while parent
+      (when (member (treesit-node-type parent)
+                    anvil-file--yaml-collection-node-types)
+        (setq depth (1+ depth)))
+      (setq parent (treesit-node-parent parent)))
+    (max 1 depth)))
+
+(defun anvil-file--outline-yaml ()
+  "Parse the current buffer as YAML and return structural key entries.
+All top-level keys are included.  Nested scalar leaves are omitted so
+large configuration files retain their hierarchy without repeating
+every field."
+  (unless (and (require 'treesit nil t)
+               (fboundp 'treesit-ready-p)
+               (treesit-ready-p 'yaml t))
+    (error
+     "YAML tree-sitter grammar is unavailable; install tree-sitter-yaml"))
+  (let ((parser (treesit-parser-create 'yaml))
+        items)
+    (unwind-protect
+        (let ((root (treesit-parser-root-node parser)))
+          (when (treesit-node-check root 'has-error)
+            (error "YAML parse error in input"))
+          (cl-labels
+              ((walk
+                (node)
+                (when (anvil-file--yaml-pair-p node)
+                  (let* ((key (treesit-node-child-by-field-name node "key"))
+                         (value (treesit-node-child-by-field-name node "value"))
+                         (depth (anvil-file--yaml-pair-depth node)))
+                    (when (and key
+                               (or (= depth 1)
+                                   (anvil-file--yaml-collection-p value)))
+                      (push
+                       (list :kind (format "key%d" depth)
+                             :name (string-trim (treesit-node-text key t))
+                             :line (line-number-at-pos
+                                    (treesit-node-start node)))
+                       items))))
+                (dotimes (index (treesit-node-child-count node t))
+                  (walk (treesit-node-child node index t)))))
+            (walk root))
+          (nreverse items))
+      (treesit-parser-delete parser))))
+
 (defun anvil-file--tool-outline (path &optional format)
   "Return a compact outline of PATH without sending the whole file.
 
 MCP Parameters:
   path   - Path to the file to scan (string).
-  format - Optional format override: \"elisp\", \"org\", \"markdown\".
+  format - Optional format override: \"elisp\", \"org\", \"markdown\",
+           or \"yaml\".
            When omitted the format is inferred from the file extension
-           (.el / .org / .md|.markdown).
+           (.el / .org / .md|.markdown / .yaml|.yml).
 
 Returns a printed plist:
   (:path P :format F :count N :items ((:kind K :name N :line L) ...))
@@ -2470,6 +2556,7 @@ Kinds:
             defstruct, advice-add
   org     : h1 .. h6 (star count)
   md      : h1 .. h6 (hash count)
+  yaml    : key1, key2, ... (mapping-key nesting depth)
 
 Ideal for orienting in large files before any Read call — saves
 the full body from the response."
@@ -2481,6 +2568,7 @@ the full body from the response."
                      ((or "el" "elc") "elisp")
                      ("org" "org")
                      ((or "md" "markdown") "markdown")
+                     ((or "yaml" "yml") "yaml")
                      (_ nil))))
           (items
            (with-temp-buffer
@@ -2490,6 +2578,7 @@ the full body from the response."
                ("elisp"    (anvil-file--outline-elisp))
                ("org"      (anvil-file--outline-org))
                ("markdown" (anvil-file--outline-markdown))
+               ("yaml"     (anvil-file--outline-yaml))
                (_ (error "Unknown format for %s (pass format= to override)"
                          abs))))))
      (format "%S" (list :path abs
@@ -2672,9 +2761,11 @@ coordinated multi-file refactors."
    :description
    "Layer 1 of anvil progressive disclosure (see `disclosure-help').
 Return a compact structural outline of a file without reading its
-body.  Infers format from extension (.el / .org / .md) or accepts a
-format= override.  Emits (:kind :name :line) entries for Elisp
-def-forms, org headlines, or Markdown headings.  Use this FIRST
+body.  Infers format from extension (.el / .org / .md / .yaml /
+.yml) or accepts a format= override.  Emits (:kind :name :line)
+entries for Elisp
+def-forms, org headlines, Markdown headings, or structural YAML keys.
+Use this FIRST
 to orient in large files before deciding whether to escalate to
 Layer 2 (`file-read-snippet') or Layer 3 (`file-read').  Tool
 descriptions and disclosure-help cover the full contract."

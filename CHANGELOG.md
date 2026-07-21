@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `file-outline` now recognizes `.yaml` and `.yml` files and returns a
+  compact tree-sitter-backed outline of their structural mapping keys.
+
 ### Changed
 
 - Host shell capture now has a non-optional 16 MiB ceiling per stream,
